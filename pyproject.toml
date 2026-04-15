@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py-mono-agent"
+version = "0.1.0"
+description = "Python AI agent framework inspired by badlogic/pi-mono."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.76.0",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0.0",
+]
+
+[project.scripts]
+py-mono-agent = "pi_code_agent.cli:main"
+
+[project.optional-dependencies]
+proxy = ["aiohttp>=3.10.0"]
+
+[tool.setuptools]
+include-package-data = true
+py-modules = ["pi_logger"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pi_ai*", "pi_agent_core*", "pi_code_agent*"]
+
+[tool.setuptools.package-data]
+pi_ai = ["llm.yaml.example"]
+
+[tool.uv]
+package = true

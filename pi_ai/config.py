@@ -7,6 +7,7 @@ LLM 配置管理
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -14,6 +15,22 @@ import yaml
 
 from .llm import Model
 from pi_logger import get_logger
+
+
+_ENV_VAR_PATTERN = re.compile(r"^\$\{([^}:]+)(?::([^}]*))?\}$")
+
+
+def _resolve_env_value(value: Any) -> Any:
+    """Resolve ${VAR} / ${VAR:default} placeholders."""
+    if not isinstance(value, str):
+        return value
+
+    match = _ENV_VAR_PATTERN.match(value.strip())
+    if not match:
+        return value
+
+    var_name, default = match.groups()
+    return os.environ.get(var_name, default or "")
 
 
 class LLMConfig:
@@ -98,11 +115,7 @@ class LLMConfig:
         config = llms[name]
 
         # 环境变量替换
-        api_key = config.get("api_key", "")
-        if api_key and api_key.endswith(":") and "$" in api_key:
-            # 处理 ${VAR:default} 格式
-            var_name = api_key.split("${")[1].split("}")[0].split(":")[0]
-            api_key = os.environ.get(var_name, "")
+        api_key = _resolve_env_value(config.get("api_key", ""))
 
         # 如果 API key 为空，尝试从环境变量获取
         if not api_key:
@@ -115,10 +128,10 @@ class LLMConfig:
                 api_key = os.environ.get("GOOGLE_API_KEY", "")
 
         model = Model(
-            provider=config.get("provider", "openai"),
-            id=config.get("model", "gpt-4o"),
+            provider=_resolve_env_value(config.get("provider", "openai")),
+            id=_resolve_env_value(config.get("model", "gpt-4o")),
             api_key=api_key or None,
-            base_url=config.get("base_url"),
+            base_url=_resolve_env_value(config.get("base_url")),
         )
 
         self.logger.info(
@@ -194,7 +207,9 @@ def get_llm_config(config_path: Optional[str] = None) -> LLMConfig:
             # 默认路径
             import inspect
             pi_ai_dir = Path(inspect.getfile(lambda: None)).parent
-            config_path = str(pi_ai_dir / "llm.yaml")
+            default_path = pi_ai_dir / "llm.yaml"
+            example_path = pi_ai_dir / "llm.yaml.example"
+            config_path = str(default_path if default_path.exists() else example_path)
 
         _default_config = LLMConfig(config_path)
 

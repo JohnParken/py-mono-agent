@@ -46,6 +46,195 @@ cd py-mono
 pip install -e .
 ```
 
+### 使用 uv 开发
+
+本项目已经配置好 `uv`，推荐把它作为默认的 Python 环境和依赖管理工具。
+
+#### 1. 初始化开发环境
+
+```bash
+git clone https://github.com/encyc/py-mono.git
+cd py-mono
+
+# 根据 pyproject.toml 和 uv.lock 创建虚拟环境并同步依赖
+uv sync
+```
+
+如果你需要使用代理流相关功能，可以安装额外依赖：
+
+```bash
+uv sync --extra proxy
+```
+
+执行完成后，项目根目录会生成 `.venv/`，后续所有开发命令都建议通过 `uv run` 执行。
+
+#### 2. 日常写代码的常用命令
+
+```bash
+# 运行一个 Python 脚本
+uv run python your_script.py
+
+# 直接运行一小段调试代码
+uv run python -c "import pi_ai; print(pi_ai.__version__)"
+
+# 进入项目虚拟环境的 Python 交互式解释器
+uv run python
+```
+
+如果你习惯先激活虚拟环境，也可以执行：
+
+```bash
+source .venv/bin/activate
+python your_script.py
+```
+
+不过对这个项目来说，更推荐 `uv run ...`，这样不容易混用系统 Python。
+
+#### 3. 新增依赖
+
+开发过程中如果需要安装新包，推荐直接用 `uv add`，它会自动更新 `pyproject.toml` 和 `uv.lock`：
+
+```bash
+# 添加运行时依赖
+uv add requests
+
+# 添加可选依赖到 proxy 组
+uv add --optional proxy aiohttp
+```
+
+如果你只是修改了 `pyproject.toml`，也可以重新同步：
+
+```bash
+uv sync
+```
+
+#### 4. 运行项目代码
+
+仓库当前主要提供两个包：`pi_ai` 和 `pi_agent_core`。开发时可以直接这样验证导入是否正常：
+
+```bash
+uv run python -c "import pi_ai, pi_agent_core; print(pi_ai.__version__, pi_agent_core.__version__)"
+```
+
+如果你想新建一个本地实验脚本，例如 `examples/demo.py`，可以直接：
+
+```bash
+uv run python examples/demo.py
+```
+
+#### 5. 更新锁文件
+
+当依赖发生变更时，可以重新生成锁文件并同步环境：
+
+```bash
+uv lock
+uv sync
+```
+
+这样团队成员拉取代码后，只需要执行一次 `uv sync`，就能得到一致的开发环境。
+
+### 作为代码助手运行
+
+这个仓库现在带了一个最小可用的代码助手 CLI，参考了 `badlogic/pi-mono` 的基础闭环思路：让模型通过工具来读文件、搜代码、改文件和执行命令。
+
+内置工具包括：
+
+- `list_files`：列出工作区文件
+- `read_file`：按行读取文件
+- `search_code`：搜索代码内容
+- `write_file`：写入文件
+- `edit_file`：按精确文本替换内容
+- `run_command`：在工作区内执行命令
+
+#### 1. 准备模型配置
+
+你可以直接复用 `pi_ai/llm.yaml.example` 作为模板，并通过环境变量提供 API Key。
+
+如果使用 OpenAI：
+
+```bash
+export OPENAI_API_KEY=your-key
+```
+
+如果你想用 OpenRouter 来验证，可以新建 `pi_ai/llm.yaml`：
+
+```yaml
+use_llm: openrouter
+
+llms:
+  openrouter:
+    provider: openai
+    api_key: ${OPENROUTER_API_KEY:}
+    base_url: https://openrouter.ai/api/v1
+    model: openai/gpt-5.2
+    description: "OpenRouter"
+```
+
+然后设置环境变量：
+
+```bash
+export OPENROUTER_API_KEY=your-openrouter-key
+```
+
+如果你有自己的配置文件，也可以在启动时通过 `--config` 指定。
+
+#### 2. 启动交互式代码助手
+
+```bash
+uv run py-mono-agent --workspace .
+```
+
+启动后可以直接输入类似下面的请求：
+
+```text
+找出项目里和 model router 相关的代码，然后解释它是怎么工作的
+```
+
+#### 3. 单次执行一个任务
+
+```bash
+uv run py-mono-agent --workspace . "读取 README，然后帮我总结当前项目结构"
+```
+
+#### 4. 指定模型
+
+如果你不想走配置文件，也可以直接指定 provider 和 model。
+
+直接指定 OpenAI：
+
+```bash
+uv run py-mono-agent \
+  --workspace . \
+  --provider openai \
+  --model gpt-4o-mini \
+  --api-key "$OPENAI_API_KEY" \
+  "搜索项目里所有 AgentTool 的定义"
+```
+
+直接指定 OpenRouter：
+
+```bash
+uv run py-mono-agent \
+  --workspace . \
+  --provider openai \
+  --model openai/gpt-5.2 \
+  --api-key "$OPENROUTER_API_KEY" \
+  --base-url https://openrouter.ai/api/v1 \
+  "搜索项目里所有 AgentTool 的定义"
+```
+
+如果你已经把 OpenRouter 写进了 `pi_ai/llm.yaml`，也可以直接：
+
+```bash
+uv run py-mono-agent --workspace . --config pi_ai/llm.yaml
+```
+
+#### 5. 工作方式和边界
+
+- 工具只允许操作 `--workspace` 指定的目录，默认是当前目录。
+- 这是一个“最小闭环”版本，适合本地代码阅读、简单修改和命令验证。
+- 当前还没有 TUI/Web UI、多工作区、补丁审阅流或更细粒度权限系统。
+
 ### 依赖
 
 - Python 3.10+
