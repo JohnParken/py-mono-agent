@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List
@@ -112,7 +114,7 @@ class SearchArgs(BaseModel):
     )
 
 
-class BashArgs(BaseModel):
+class ShellArgs(BaseModel):
     command: str = Field(description="Shell command to execute inside the workspace.")
     cwd: str = Field(
         default=".",
@@ -124,6 +126,10 @@ class BashArgs(BaseModel):
         le=600,
         description="Timeout in seconds.",
     )
+
+
+# Backward-compatible alias for earlier internal naming.
+BashArgs = ShellArgs
 
 
 def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
@@ -259,7 +265,7 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
 
     async def run_command(
         tool_call_id: str,
-        args: BashArgs,
+        args: ShellArgs,
         cancel_event,
         update_callback,
     ) -> AgentToolResult:
@@ -271,9 +277,9 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
                 f"Working directory must be a directory: {workspace.display_path(cwd)}"
             )
         _guard_command(args.command)
-        shell = os.environ.get("SHELL", "/bin/zsh")
+        command_args, shell_name = _build_shell_command(args.command)
         completed = subprocess.run(
-            [shell, "-lc", args.command],
+            command_args,
             cwd=str(cwd),
             capture_output=True,
             text=True,
@@ -289,6 +295,7 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         combined = _truncate(combined, MAX_OUTPUT_CHARS)
         summary = (
             f"Command: {args.command}\n"
+            f"Shell: {shell_name}\n"
             f"Exit code: {completed.returncode}\n"
             f"Working directory: {workspace.display_path(cwd)}\n"
             f"Output:\n{combined}"
@@ -334,8 +341,8 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         AgentTool(
             name="run_command",
             label="Run Command",
-            description="Run a shell command inside the workspace.",
-            parameters=BashArgs,
+            description="Run a shell command inside the workspace using the native shell for the current OS.",
+            parameters=ShellArgs,
             execute=run_command,
         ),
     ]
@@ -403,3 +410,16 @@ def _guard_command(command: str) -> None:
     )
     if any(token in lowered for token in banned):
         raise ValueError("Refusing to run a clearly destructive shell command.")
+
+
+def _build_shell_command(command: str) -> tuple[list[str], str]:
+    if sys.platform == "win32":
+        powershell = shutil.which("pwsh") or shutil.which("powershell.exe")
+        if powershell:
+            return [powershell, "-NoProfile", "-Command", command], Path(powershell).name
+
+        comspec = os.environ.get("COMSPEC", "cmd.exe")
+        return [comspec, "/d", "/s", "/c", command], Path(comspec).name
+
+    shell = os.environ.get("SHELL", "/bin/zsh")
+    return [shell, "-lc", command], Path(shell).name

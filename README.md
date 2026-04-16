@@ -36,6 +36,8 @@ pi_agent_core/  # Agent 核心实现
 
 ## 安装
 
+macOS / Linux:
+
 ```bash
 # 从 GitHub 安装
 pip install git+https://github.com/encyc/py-mono.git
@@ -46,11 +48,37 @@ cd py-mono
 pip install -e .
 ```
 
+Windows PowerShell:
+
+```powershell
+# 从 GitHub 安装
+pip install git+https://github.com/encyc/py-mono.git
+
+# 或本地开发模式
+git clone https://github.com/encyc/py-mono.git
+cd py-mono
+pip install -e .
+```
+
+Windows `cmd.exe`:
+
+```bat
+REM 从 GitHub 安装
+pip install git+https://github.com/encyc/py-mono.git
+
+REM 或本地开发模式
+git clone https://github.com/encyc/py-mono.git
+cd py-mono
+pip install -e .
+```
+
 ### 使用 uv 开发
 
 本项目已经配置好 `uv`，推荐把它作为默认的 Python 环境和依赖管理工具。
 
 #### 1. 初始化开发环境
+
+macOS / Linux:
 
 ```bash
 git clone https://github.com/encyc/py-mono.git
@@ -66,9 +94,37 @@ uv sync
 uv sync --extra proxy
 ```
 
+Windows PowerShell:
+
+```powershell
+git clone https://github.com/encyc/py-mono.git
+cd py-mono
+
+# 根据 pyproject.toml 和 uv.lock 创建虚拟环境并同步依赖
+uv sync
+
+# 如果需要代理流功能
+uv sync --extra proxy
+```
+
+Windows `cmd.exe`:
+
+```bat
+git clone https://github.com/encyc/py-mono.git
+cd py-mono
+
+REM 根据 pyproject.toml 和 uv.lock 创建虚拟环境并同步依赖
+uv sync
+
+REM 如果需要代理流功能
+uv sync --extra proxy
+```
+
 执行完成后，项目根目录会生成 `.venv/`，后续所有开发命令都建议通过 `uv run` 执行。
 
 #### 2. 日常写代码的常用命令
+
+macOS / Linux:
 
 ```bash
 # 运行一个 Python 脚本
@@ -81,7 +137,35 @@ uv run python -c "import pi_ai; print(pi_ai.__version__)"
 uv run python
 ```
 
-如果你习惯先激活虚拟环境，也可以执行：
+Windows PowerShell:
+
+```powershell
+# 运行一个 Python 脚本
+uv run python your_script.py
+
+# 直接运行一小段调试代码
+uv run python -c "import pi_ai; print(pi_ai.__version__)"
+
+# 进入项目虚拟环境的 Python 交互式解释器
+uv run python
+```
+
+Windows `cmd.exe`:
+
+```bat
+REM 运行一个 Python 脚本
+uv run python your_script.py
+
+REM 直接运行一小段调试代码
+uv run python -c "import pi_ai; print(pi_ai.__version__)"
+
+REM 进入项目虚拟环境的 Python 交互式解释器
+uv run python
+```
+
+如果你习惯先激活虚拟环境，也可以执行。
+
+macOS / Linux:
 
 ```bash
 source .venv/bin/activate
@@ -90,15 +174,51 @@ python your_script.py
 
 不过对这个项目来说，更推荐 `uv run ...`，这样不容易混用系统 Python。
 
+Windows PowerShell:
+
+```powershell
+.venv\Scripts\Activate.ps1
+python your_script.py
+```
+
+Windows `cmd.exe`:
+
+```bat
+.venv\Scripts\activate.bat
+python your_script.py
+```
+
 #### 3. 新增依赖
 
 开发过程中如果需要安装新包，推荐直接用 `uv add`，它会自动更新 `pyproject.toml` 和 `uv.lock`：
+
+macOS / Linux:
 
 ```bash
 # 添加运行时依赖
 uv add requests
 
 # 添加可选依赖到 proxy 组
+uv add --optional proxy aiohttp
+```
+
+Windows PowerShell:
+
+```powershell
+# 添加运行时依赖
+uv add requests
+
+# 添加可选依赖到 proxy 组
+uv add --optional proxy aiohttp
+```
+
+Windows `cmd.exe`:
+
+```bat
+REM 添加运行时依赖
+uv add requests
+
+REM 添加可选依赖到 proxy 组
 uv add --optional proxy aiohttp
 ```
 
@@ -112,6 +232,8 @@ uv sync
 
 仓库当前主要提供两个包：`pi_ai` 和 `pi_agent_core`。开发时可以直接这样验证导入是否正常：
 
+macOS / Linux:
+
 ```bash
 uv run python -c "import pi_ai, pi_agent_core; print(pi_ai.__version__, pi_agent_core.__version__)"
 ```
@@ -122,11 +244,41 @@ uv run python -c "import pi_ai, pi_agent_core; print(pi_ai.__version__, pi_agent
 uv run python examples/demo.py
 ```
 
+Windows PowerShell:
+
+```powershell
+uv run python -c "import pi_ai, pi_agent_core; print(pi_ai.__version__, pi_agent_core.__version__)"
+uv run python examples/demo.py
+```
+
+Windows `cmd.exe`:
+
+```bat
+uv run python -c "import pi_ai, pi_agent_core; print(pi_ai.__version__, pi_agent_core.__version__)"
+uv run python examples/demo.py
+```
+
 #### 5. 更新锁文件
 
 当依赖发生变更时，可以重新生成锁文件并同步环境：
 
+macOS / Linux:
+
 ```bash
+uv lock
+uv sync
+```
+
+Windows PowerShell:
+
+```powershell
+uv lock
+uv sync
+```
+
+Windows `cmd.exe`:
+
+```bat
 uv lock
 uv sync
 ```
@@ -156,6 +308,18 @@ uv sync
 export OPENAI_API_KEY=your-key
 ```
 
+Windows PowerShell:
+
+```powershell
+$env:OPENAI_API_KEY="your-key"
+```
+
+Windows `cmd.exe`:
+
+```bat
+set OPENAI_API_KEY=your-key
+```
+
 如果你想用 OpenRouter 来验证，可以新建 `pi_ai/llm.yaml`：
 
 ```yaml
@@ -176,11 +340,37 @@ llms:
 export OPENROUTER_API_KEY=your-openrouter-key
 ```
 
+Windows PowerShell:
+
+```powershell
+$env:OPENROUTER_API_KEY="your-openrouter-key"
+```
+
+Windows `cmd.exe`:
+
+```bat
+set OPENROUTER_API_KEY=your-openrouter-key
+```
+
 如果你有自己的配置文件，也可以在启动时通过 `--config` 指定。
 
 #### 2. 启动交互式代码助手
 
+macOS / Linux:
+
 ```bash
+uv run py-mono-agent --workspace .
+```
+
+Windows PowerShell:
+
+```powershell
+uv run py-mono-agent --workspace .
+```
+
+Windows `cmd.exe`:
+
+```bat
 uv run py-mono-agent --workspace .
 ```
 
@@ -192,7 +382,21 @@ uv run py-mono-agent --workspace .
 
 #### 3. 单次执行一个任务
 
+macOS / Linux:
+
 ```bash
+uv run py-mono-agent --workspace . "读取 README，然后帮我总结当前项目结构"
+```
+
+Windows PowerShell:
+
+```powershell
+uv run py-mono-agent --workspace . "读取 README，然后帮我总结当前项目结构"
+```
+
+Windows `cmd.exe`:
+
+```bat
 uv run py-mono-agent --workspace . "读取 README，然后帮我总结当前项目结构"
 ```
 
@@ -211,6 +415,17 @@ uv run py-mono-agent \
   "搜索项目里所有 AgentTool 的定义"
 ```
 
+Windows PowerShell:
+
+```powershell
+uv run py-mono-agent `
+  --workspace . `
+  --provider openai `
+  --model gpt-4o-mini `
+  --api-key $env:OPENAI_API_KEY `
+  "搜索项目里所有 AgentTool 的定义"
+```
+
 直接指定 OpenRouter：
 
 ```bash
@@ -223,15 +438,54 @@ uv run py-mono-agent \
   "搜索项目里所有 AgentTool 的定义"
 ```
 
+Windows PowerShell:
+
+```powershell
+uv run py-mono-agent `
+  --workspace . `
+  --provider openai `
+  --model openai/gpt-5.2 `
+  --api-key $env:OPENROUTER_API_KEY `
+  --base-url https://openrouter.ai/api/v1 `
+  "搜索项目里所有 AgentTool 的定义"
+```
+
+Windows `cmd.exe`:
+
+```bat
+uv run py-mono-agent ^
+  --workspace . ^
+  --provider openai ^
+  --model openai/gpt-5.2 ^
+  --api-key %OPENROUTER_API_KEY% ^
+  --base-url https://openrouter.ai/api/v1 ^
+  "搜索项目里所有 AgentTool 的定义"
+```
+
 如果你已经把 OpenRouter 写进了 `pi_ai/llm.yaml`，也可以直接：
 
+macOS / Linux:
+
 ```bash
+uv run py-mono-agent --workspace . --config pi_ai/llm.yaml
+```
+
+Windows PowerShell:
+
+```powershell
+uv run py-mono-agent --workspace . --config pi_ai/llm.yaml
+```
+
+Windows `cmd.exe`:
+
+```bat
 uv run py-mono-agent --workspace . --config pi_ai/llm.yaml
 ```
 
 #### 5. 工作方式和边界
 
 - 工具只允许操作 `--workspace` 指定的目录，默认是当前目录。
+- `run_command` 会自动选择当前平台的本机 shell：Windows 优先 PowerShell，否则回退到 `cmd.exe`；macOS/Linux 使用当前 `$SHELL`。
 - 这是一个“最小闭环”版本，适合本地代码阅读、简单修改和命令验证。
 - 当前还没有 TUI/Web UI、多工作区、补丁审阅流或更细粒度权限系统。
 

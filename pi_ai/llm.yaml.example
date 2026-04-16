@@ -54,3 +54,11 @@ llms:
     base_url: https://api.deepseek.com/v1
     model: deepseek-chat
     description: "DeepSeek Chat"
+
+  # Qwen 兼容 Provider（requests 实现）
+  qwen_compatible:
+    provider: QwenLLMprovider
+    api_key: ${DASHSCOPE_API_KEY:}
+    base_url: https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation
+    model: qwen-plus
+    description: "Qwen Native DashScope Provider"
