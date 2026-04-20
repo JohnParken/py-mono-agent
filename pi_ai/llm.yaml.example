@@ -55,10 +55,31 @@ llms:
     model: deepseek-chat
     description: "DeepSeek Chat"
 
-  # Qwen 兼容 Provider（requests 实现）
+  # Qwen 自定义 Provider（requests 实现）
+  # 对应请求体中的:
+  # - token   <- api_key / DASHSCOPE_API_KEY
+  # - apikey  <- 运行时通过 QWEN_APP_API_KEY 或 app_api_key 传入
+  # - modelId <- model
+  #
+  # 可选的 appInfo 字段（如 agent_id / temperature / max_new_tokens）
+  # 由调用时的额外参数传入，而不是直接从这份 YAML 读取。
   qwen_compatible:
     provider: QwenLLMprovider
     api_key: ${DASHSCOPE_API_KEY:}
     base_url: https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation
-    model: qwen-plus
-    description: "Qwen Native DashScope Provider"
+    model: lightapplication
+    description: "Qwen Custom Streaming Provider"
+
+# 运行 Qwen Provider 前，通常还需要设置：
+#
+# macOS / Linux:
+#   export DASHSCOPE_API_KEY=your-token
+#   export QWEN_APP_API_KEY=your-app-api-key
+#
+# Windows PowerShell:
+#   $env:DASHSCOPE_API_KEY="your-token"
+#   $env:QWEN_APP_API_KEY="your-app-api-key"
+#
+# Windows cmd.exe:
+#   set DASHSCOPE_API_KEY=your-token
+#   set QWEN_APP_API_KEY=your-app-api-key

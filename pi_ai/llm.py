@@ -625,9 +625,9 @@ class QwenLLMProvider:
     """
     Qwen Provider 适配器。
 
-    使用 requests 库请求 DashScope 原生文本生成接口。
-    construct_request() 基于 JSON 模板字符串做深拷贝，再按 messages /
-    parameters / input 等字段进行定制构造。
+    使用 requests 库请求 Qwen 自定义接口。
+    construct_request() 基于 JSON 模板字符串做深拷贝，再按 token /
+    appInfo / variable / data.messages 等字段进行定制构造。
     """
 
     DEFAULT_BASE_URL = (
@@ -635,11 +635,29 @@ class QwenLLMProvider:
     )
     REQUEST_TEMPLATE_JSON = json.dumps(
         {
-            "model": "",
-            "input": {"messages": []},
-            "parameters": {
-                "result_format": "message",
-                "incremental_output": True,
+            "token": "XmАРKVhwH5q+UQpЗdJ8Bnq6YR6K2ApeeL1LgSyMTWB069+B+ivOC38MŁ0E4V5Jft6LwZgEI7HBA9YwAD3znh9HgWt4t7OMLYUD6
+TFfdSZX5886A4E1Q090EhiIHRXs28DUQAX3d0S1/3B8TQdcZtG7rliSWonki/Y@WW41utjNDfYZcXpkuo+JpHKke4BpqCt/9kB4N2",
+            "apikey": "",
+            "type": "txt",
+            "modelId": "lightapplication",
+            "appInfo": {
+                "agent_id": "e76d09a-fed2-4ac1-9317-bf419f624c21",
+                "sensitive_judge": False,
+                "safe_model_judge": False,
+                "max_new_tokens": 20480,
+                "temperature": 0.3,
+                "name": "Chat-Medium",
+                "prompt": "(sys_prompt_content)",
+            },
+            "variable": [
+                {
+                    "name": "sys_prompt_content",
+                    "value": "",
+                }
+            ],
+            "data": {
+                "messages": [],
+                "stream": True,
             },
         }
     )
@@ -655,49 +673,16 @@ class QwenLLMProvider:
         """
         构造请求参数。
 
-        基于 JSON 模板字符串做深拷贝，再注入 messages、parameters 等字段。
+        基于固定 JSON 模板字符串做深拷贝，仅动态填充 data.messages。
         """
         template_json = kwargs.pop("request_template_json", self.REQUEST_TEMPLATE_JSON)
         payload = self._clone_request_template(template_json)
 
-        payload["model"] = model.id
-        payload.setdefault("input", {})
-        payload["input"]["messages"] = self._build_messages(messages, system_prompt)
-
-        parameters = payload.setdefault("parameters", {})
-        parameters.setdefault("result_format", "message")
-        parameters.setdefault("incremental_output", True)
-
-        # 将 reasoning 语义映射到 Qwen 的 enable_thinking。
-        reasoning = kwargs.pop("reasoning", None)
-        if reasoning is not None:
-            parameters["enable_thinking"] = reasoning != "off"
+        data = payload.setdefault("data", {})
+        data["messages"] = self._build_messages(messages, system_prompt)
 
         if tools:
-            payload["tools"] = self._build_tools(tools)
-
-        # 允许调用方直接定制原生 input / parameters 字段。
-        input_overrides = kwargs.pop("input", None)
-        if isinstance(input_overrides, dict):
-            payload["input"].update(self._deep_copy_json_value(input_overrides))
-            payload["input"]["messages"] = self._build_messages(messages, system_prompt)
-
-        parameter_overrides = kwargs.pop("parameters", None)
-        if isinstance(parameter_overrides, dict):
-            parameters.update(self._deep_copy_json_value(parameter_overrides))
-
-        request_overrides = kwargs.pop("request_overrides", None)
-        if isinstance(request_overrides, dict):
-            payload = self._deep_merge(payload, self._deep_copy_json_value(request_overrides))
-            payload["model"] = model.id
-            payload.setdefault("input", {})
-            payload["input"]["messages"] = self._build_messages(messages, system_prompt)
-            parameters = payload.setdefault("parameters", {})
-
-        excluded_keys = ("signal", "api_key", "session_id", "user_id", "project_id", "timeout")
-        for key, value in kwargs.items():
-            if key not in excluded_keys and value is not None:
-                parameters[key] = value
+            data["tools"] = self._build_tools(tools)
 
         return payload
 
@@ -728,22 +713,20 @@ class QwenLLMProvider:
         system_prompt: str,
     ) -> List[Dict[str, Any]]:
         api_messages: List[Dict[str, Any]] = []
-        if system_prompt:
-            api_messages.append({"role": "system", "content": system_prompt})
 
         for msg in messages:
             if msg.role == "user":
                 api_messages.append(
                     {
                         "role": "user",
-                        "content": self._stringify_message_content(msg.content),
+                        "content": self._build_message_content(msg.content),
                     }
                 )
 
             elif msg.role == "assistant":
                 assistant_msg: Dict[str, Any] = {
                     "role": "assistant",
-                    "content": self._stringify_message_content(msg.content),
+                    "content": self._build_message_content(msg.content),
                 }
                 tool_calls = []
                 for content in msg.content:
@@ -766,25 +749,44 @@ class QwenLLMProvider:
                 api_messages.append(
                     {
                         "role": "tool",
-                        "content": self._stringify_message_content(msg.content),
+                        "content": self._build_message_content(msg.content),
                         "tool_call_id": msg.tool_call_id,
                     }
                 )
 
         return api_messages
 
-    def _stringify_message_content(self, content_blocks: List[Any]) -> str:
-        parts: List[str] = []
+    def _build_message_content(self, content_blocks: List[Any]) -> List[Dict[str, Any]]:
+        parts: List[Dict[str, Any]] = []
         for content in content_blocks:
             if content.type == "text":
-                parts.append(content.text)
+                parts.append({"type": "text", "value": content.text})
             elif content.type == "thinking":
-                parts.append(content.thinking)
+                parts.append({"type": "text", "value": content.thinking})
             elif content.type == "image":
                 raise ValueError(
                     "QwenLLMProvider 当前使用文本生成接口，不支持 image content。"
                 )
-        return "".join(parts)
+        return parts
+
+    def _build_variables(
+        self,
+        system_prompt: str,
+        variables_override: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        variables = [{"name": "sys_prompt_content", "value": system_prompt or ""}]
+        if not variables_override:
+            return variables
+
+        copied = self._deep_copy_json_value(variables_override)
+        has_system_var = False
+        for item in copied:
+            if item.get("name") == "sys_prompt_content":
+                item["value"] = system_prompt or ""
+                has_system_var = True
+        if not has_system_var:
+            copied.append({"name": "sys_prompt_content", "value": system_prompt or ""})
+        return copied
 
     def _build_tools(self, tools: List[ToolDef]) -> List[Dict[str, Any]]:
         api_tools = []
