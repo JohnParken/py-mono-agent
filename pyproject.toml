@@ -7,7 +7,7 @@ name = "py-mono-agent"
 version = "0.1.0"
 description = "Python AI agent framework inspired by badlogic/pi-mono."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "openai>=1.76.0",
     "pydantic>=2.0.0",
