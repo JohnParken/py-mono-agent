@@ -635,11 +635,10 @@ class QwenLLMProvider:
     )
     REQUEST_TEMPLATE_JSON = json.dumps(
         {
-            "token": "XmАРKVhwH5q+UQpЗdJ8Bnq6YR6K2ApeeL1LgSyMTWB069+B+ivOC38MŁ0E4V5Jft6LwZgEI7HBA9YwAD3znh9HgWt4t7OMLYUD6
-TFfdSZX5886A4E1Q090EhiIHRXs28DUQAX3d0S1/3B8TQdcZtG7rliSWonki/Y@WW41utjNDfYZcXpkuo+JpHKke4BpqCt/9kB4N2",
+            "token": "",
             "apikey": "",
             "type": "txt",
-            "modelId": "lightapplication",
+            "modelId": "light-demo",
             "appInfo": {
                 "agent_id": "e76d09a-fed2-4ac1-9317-bf419f624c21",
                 "sensitive_judge": False,
