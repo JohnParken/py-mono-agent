@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from pi_ai.types import TextContent
 from pi_agent_core.types import AgentTool, AgentToolResult
+from pi_logger import get_logger
 
 
 DEFAULT_IGNORED_DIRS = {
@@ -33,6 +34,8 @@ DEFAULT_IGNORED_DIRS = {
 MAX_READ_LINES = 400
 MAX_OUTPUT_CHARS = 24_000
 MAX_FILE_SIZE = 512 * 1024
+
+logger = get_logger("pi_code_agent.tools")
 
 
 @dataclass(frozen=True)
@@ -134,6 +137,7 @@ BashArgs = ShellArgs
 
 def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
     workspace = Workspace(Path(workspace_root).resolve())
+    logger.info("[CODE-TOOL] creating coding tools for workspace=%s", workspace.root)
 
     async def read_file(
         tool_call_id: str,
@@ -141,6 +145,13 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         cancel_event,
         update_callback,
     ) -> AgentToolResult:
+        logger.info(
+            "[CODE-TOOL] read_file start tool_call_id=%s path=%s start_line=%s end_line=%s",
+            tool_call_id,
+            args.path,
+            args.start_line,
+            args.end_line,
+        )
         path = workspace.resolve_path(args.path, allow_root=False)
         if not path.exists():
             raise FileNotFoundError(f"File not found: {workspace.display_path(path)}")
@@ -161,6 +172,11 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
             f"LINES: {start}-{start + max(len(selected) - 1, 0)} of {len(lines)}\n"
             f"{body}"
         )
+        logger.info(
+            "[CODE-TOOL] read_file success path=%s selected_lines=%s",
+            workspace.display_path(path),
+            len(selected),
+        )
         return _result(summary)
 
     async def write_file(
@@ -169,6 +185,13 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         cancel_event,
         update_callback,
     ) -> AgentToolResult:
+        logger.info(
+            "[CODE-TOOL] write_file start tool_call_id=%s path=%s append=%s content_len=%s",
+            tool_call_id,
+            args.path,
+            args.append,
+            len(args.content),
+        )
         path = workspace.resolve_path(args.path, allow_root=False)
         if path.exists() and path.is_dir():
             raise IsADirectoryError(f"Path is a directory: {workspace.display_path(path)}")
@@ -182,6 +205,12 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         with path.open(mode, encoding="utf-8") as handle:
             handle.write(args.content)
         action = "Appended to" if args.append else "Wrote"
+        logger.info(
+            "[CODE-TOOL] write_file success path=%s action=%s content_len=%s",
+            workspace.display_path(path),
+            action,
+            len(args.content),
+        )
         return _result(
             f"{action} {workspace.display_path(path)} ({len(args.content)} characters)."
         )
@@ -192,6 +221,14 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         cancel_event,
         update_callback,
     ) -> AgentToolResult:
+        logger.info(
+            "[CODE-TOOL] edit_file start tool_call_id=%s path=%s replace_all=%s old_len=%s new_len=%s",
+            tool_call_id,
+            args.path,
+            args.replace_all,
+            len(args.old_text),
+            len(args.new_text),
+        )
         path = workspace.resolve_path(args.path, allow_root=False)
         if not path.exists():
             raise FileNotFoundError(f"File not found: {workspace.display_path(path)}")
@@ -206,6 +243,11 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         updated = text.replace(args.old_text, args.new_text) if args.replace_all else text.replace(args.old_text, args.new_text, 1)
         path.write_text(updated, encoding="utf-8")
         replaced = matches if args.replace_all else 1
+        logger.info(
+            "[CODE-TOOL] edit_file success path=%s replaced=%s",
+            workspace.display_path(path),
+            replaced,
+        )
         return _result(
             f"Updated {workspace.display_path(path)} by replacing {replaced} occurrence(s)."
         )
@@ -216,10 +258,18 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         cancel_event,
         update_callback,
     ) -> AgentToolResult:
+        logger.info(
+            "[CODE-TOOL] list_files start tool_call_id=%s path=%s recursive=%s max_entries=%s",
+            tool_call_id,
+            args.path,
+            args.recursive,
+            args.max_entries,
+        )
         path = workspace.resolve_path(args.path)
         if not path.exists():
             raise FileNotFoundError(f"Path not found: {workspace.display_path(path)}")
         if path.is_file():
+            logger.info("[CODE-TOOL] list_files target is file path=%s", workspace.display_path(path))
             return _result(workspace.display_path(path))
 
         entries = _walk_workspace(path, recursive=args.recursive, max_entries=args.max_entries)
@@ -227,6 +277,12 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         suffix = ""
         if len(entries) >= args.max_entries:
             suffix = f"\n[truncated to first {args.max_entries} entries]"
+        logger.info(
+            "[CODE-TOOL] list_files success path=%s entries=%s truncated=%s",
+            workspace.display_path(path),
+            len(entries),
+            len(entries) >= args.max_entries,
+        )
         return _result(rendered + suffix if rendered else "[empty directory]")
 
     async def search_code(
@@ -235,6 +291,14 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         cancel_event,
         update_callback,
     ) -> AgentToolResult:
+        logger.info(
+            "[CODE-TOOL] search_code start tool_call_id=%s path=%s literal=%s max_results=%s pattern=%r",
+            tool_call_id,
+            args.path,
+            args.literal,
+            args.max_results,
+            args.pattern[:120],
+        )
         path = workspace.resolve_path(args.path)
         if not path.exists():
             raise FileNotFoundError(f"Path not found: {workspace.display_path(path)}")
@@ -257,10 +321,17 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
                     if len(hits) >= args.max_results:
                         break
         if not hits:
+            logger.info("[CODE-TOOL] search_code success path=%s hits=0", workspace.display_path(path))
             return _result("No matches found.")
         suffix = ""
         if len(hits) >= args.max_results:
             suffix = f"\n[truncated to first {args.max_results} matches]"
+        logger.info(
+            "[CODE-TOOL] search_code success path=%s hits=%s truncated=%s",
+            workspace.display_path(path),
+            len(hits),
+            len(hits) >= args.max_results,
+        )
         return _result("\n".join(hits) + suffix)
 
     async def run_command(
@@ -269,6 +340,13 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         cancel_event,
         update_callback,
     ) -> AgentToolResult:
+        logger.info(
+            "[CODE-TOOL] run_command start tool_call_id=%s cwd=%s timeout=%s command=%r",
+            tool_call_id,
+            args.cwd,
+            args.timeout,
+            args.command[:200],
+        )
         cwd = workspace.resolve_path(args.cwd)
         if not cwd.exists():
             raise FileNotFoundError(f"Working directory not found: {workspace.display_path(cwd)}")
@@ -299,6 +377,13 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
             f"Exit code: {completed.returncode}\n"
             f"Working directory: {workspace.display_path(cwd)}\n"
             f"Output:\n{combined}"
+        )
+        logger.info(
+            "[CODE-TOOL] run_command success cwd=%s shell=%s exit_code=%s output_len=%s",
+            workspace.display_path(cwd),
+            shell_name,
+            completed.returncode,
+            len(combined),
         )
         return _result(summary)
 

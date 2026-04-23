@@ -690,6 +690,71 @@ class QwenLLMProvider:
             raise TypeError("request_template_json must be a JSON string.")
         return json.loads(template_json)
 
+    def _mask_secret(self, value: Any) -> str:
+        if value is None:
+            return ""
+        text = str(value)
+        if len(text) <= 8:
+            return "*" * len(text)
+        return f"{text[:4]}...{text[-4:]}"
+
+    def _summarize_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        data = payload.get("data") or {}
+        messages = data.get("messages") or []
+        last_role = messages[-1].get("role") if messages else None
+        last_content = messages[-1].get("content") if messages else []
+        last_preview = ""
+        if isinstance(last_content, list) and last_content:
+            first_block = last_content[0] or {}
+            last_preview = str(first_block.get("value") or "")[:80]
+        return {
+            "modelId": payload.get("modelId"),
+            "type": payload.get("type"),
+            "stream": data.get("stream"),
+            "message_count": len(messages),
+            "last_role": last_role,
+            "last_preview": last_preview,
+            "tool_count": len(data.get("tools") or []),
+            "token": self._mask_secret(payload.get("token")),
+            "apikey": self._mask_secret(payload.get("apikey")),
+        }
+
+    def _sanitize_payload_for_logging(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        sanitized = self._deep_copy_json_value(payload)
+        if "token" in sanitized:
+            sanitized["token"] = self._mask_secret(sanitized.get("token"))
+        if "apikey" in sanitized:
+            sanitized["apikey"] = self._mask_secret(sanitized.get("apikey"))
+        return sanitized
+
+    def _format_json_for_logging(self, value: Any) -> str:
+        try:
+            return json.dumps(value, ensure_ascii=False, indent=2)
+        except Exception:
+            return str(value)
+
+    def _truncate_for_logging(self, value: Any, limit: int = 4000) -> str:
+        text = value if isinstance(value, str) else str(value)
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit]}...[truncated {len(text) - limit} chars]"
+
+    def _summarize_chunk(self, chunk_data: Dict[str, Any]) -> Dict[str, Any]:
+        result_preview = str(chunk_data.get("result") or "")[:80]
+        output = chunk_data.get("output") or {}
+        choices = output.get("choices") or []
+        finish_reason = None
+        if choices:
+            finish_reason = (choices[0] or {}).get("finish_reason")
+        return {
+            "status": chunk_data.get("status"),
+            "resCode": chunk_data.get("resCode"),
+            "questionId": chunk_data.get("questionId"),
+            "sessionId": chunk_data.get("sessionId"),
+            "result_preview": result_preview,
+            "finish_reason": finish_reason,
+        }
+
     def _deep_copy_json_value(self, value: Any) -> Any:
         return json.loads(json.dumps(value))
 
@@ -851,6 +916,15 @@ class QwenLLMProvider:
             **kwargs,
         )
 
+        logger.debug(
+            "[QWEN-STREAM] start provider=%s model=%s base_url=%s has_api_key=%s payload=%s",
+            model.provider,
+            model.id,
+            base_url,
+            bool(key),
+            self._summarize_payload(payload),
+        )
+
         partial = AssistantMessage(
             content=[],
             api=model.api,
@@ -882,6 +956,10 @@ class QwenLLMProvider:
                     continue
 
                 chunk_context = self._chunk_context(chunk_data)
+                logger.debug(
+                    "[QWEN-PARSED] chunk=%s",
+                    self._summarize_chunk(chunk_data),
+                )
 
                 res_code = chunk_data.get("resCode")
                 if res_code and res_code != "PLA0000":
@@ -904,6 +982,12 @@ class QwenLLMProvider:
                         text_block = partial.content[text_index]
                         if isinstance(text_block, TextContent):
                             text_block.text += delta_text
+                        logger.debug(
+                            "[QWEN-PARSED] text-delta status=%s len=%s preview=%r",
+                            chunk_data.get("status"),
+                            len(delta_text),
+                            delta_text[:80],
+                        )
                         yield StreamTextDeltaEvent(
                             content_index=text_index,
                             delta=delta_text,
@@ -920,8 +1004,13 @@ class QwenLLMProvider:
                             text_block = partial.content[text_index]
                             if isinstance(text_block, TextContent):
                                 final_text = text_block.text
+                        logger.debug(
+                            "[QWEN-STREAM] completed-via-status total_text_len=%s usage=%s",
+                            len(final_text),
+                            partial.usage,
+                        )
                         if chunk_context:
-                            logger.info("Qwen stream completed: %s", chunk_context)
+                            logger.info("[QWEN-STREAM] completed: %s", chunk_context)
                         yield StreamTextEndEvent(
                             content_index=text_index or 0,
                             content=final_text,
@@ -1026,6 +1115,11 @@ class QwenLLMProvider:
                         "total": usage.get("cost", 0),
                     },
                 }
+                logger.debug(
+                    "[QWEN-PARSED] usage finish_reason=%s usage=%s",
+                    finish_reason,
+                    partial.usage,
+                )
 
                 if text_index is not None:
                     text_block = partial.content[text_index]
@@ -1043,6 +1137,11 @@ class QwenLLMProvider:
                 else:
                     partial.stop_reason = "stop"
 
+                logger.debug(
+                    "[QWEN-STREAM] done stop_reason=%s content_count=%s",
+                    partial.stop_reason,
+                    len(partial.content),
+                )
                 yield StreamDoneEvent(reason=partial.stop_reason, message=partial)
                 return
 
@@ -1056,6 +1155,10 @@ class QwenLLMProvider:
                         partial=partial,
                     )
                 partial.stop_reason = "stop"
+                logger.debug(
+                    "[QWEN-STREAM] ended-without-explicit-completed content_count=%s",
+                    len(partial.content),
+                )
                 yield StreamDoneEvent(reason=partial.stop_reason, message=partial)
 
         except requests.HTTPError as exc:
@@ -1064,7 +1167,7 @@ class QwenLLMProvider:
             partial.stop_reason = "error"
             partial.error_message = error_str
             yield StreamErrorEvent(reason="error", error=partial)
-            logger.warning("Qwen HTTP error: %s", error_str)
+            logger.warning("[QWEN-ERROR] HTTP error: %s", error_str)
             if status_code == 401:
                 raise LLMAuthenticationError(provider=model.provider) from exc
             if status_code == 429:
@@ -1074,13 +1177,13 @@ class QwenLLMProvider:
             partial.stop_reason = "error"
             partial.error_message = str(exc)
             yield StreamErrorEvent(reason="error", error=partial)
-            logger.warning("Qwen request error: %s", exc)
+            logger.warning("[QWEN-ERROR] request error: %s", exc)
             raise LLMConnectionError(provider=model.provider) from exc
         except Exception as exc:
             partial.stop_reason = "error"
             partial.error_message = str(exc)
             yield StreamErrorEvent(reason="error", error=partial)
-            logger.warning("Qwen stream error: %s", exc)
+            logger.warning("[QWEN-ERROR] stream error: %s", exc)
 
     async def _stream_request(
         self,
@@ -1095,6 +1198,26 @@ class QwenLLMProvider:
 
         def worker() -> None:
             try:
+                request_headers = {
+                    "Authorization": f"Bearer {self._mask_secret(api_key)}",
+                    "Content-Type": "application/json",
+                }
+                logger.info(
+                    "[QWEN-REQUEST] base_url=%s timeout=%s payload=%s",
+                    base_url,
+                    timeout,
+                    self._summarize_payload(payload),
+                )
+                logger.info(
+                    "[QWEN-REQUEST] headers:\n%s",
+                    self._format_json_for_logging(request_headers),
+                )
+                logger.info(
+                    "[QWEN-REQUEST] payload(full, masked):\n%s",
+                    self._format_json_for_logging(
+                        self._sanitize_payload_for_logging(payload)
+                    ),
+                )
                 with requests.post(
                     base_url,
                     headers={
@@ -1105,6 +1228,15 @@ class QwenLLMProvider:
                     timeout=timeout,
                     stream=True,
                 ) as response:
+                    logger.debug(
+                        "[QWEN-RESPONSE] status=%s content_type=%s",
+                        response.status_code,
+                        response.headers.get("Content-Type"),
+                    )
+                    logger.debug(
+                        "[QWEN-RESPONSE] headers:\n%s",
+                        self._format_json_for_logging(dict(response.headers)),
+                    )
                     response.raise_for_status()
                     for raw_line in response.iter_lines(decode_unicode=True):
                         if not raw_line:
@@ -1115,13 +1247,27 @@ class QwenLLMProvider:
                         if line.startswith("data:"):
                             line = line[5:].strip()
                         if line == "[DONE]":
+                            logger.debug("[QWEN-RAW] received DONE marker")
                             continue
+                        logger.debug(
+                            "[QWEN-RAW] response line(full):\n%s",
+                            self._truncate_for_logging(line),
+                        )
                         try:
                             parsed = json.loads(line)
                         except json.JSONDecodeError:
+                            logger.debug(
+                                "[QWEN-RAW] line is not valid JSON, skipped:\n%s",
+                                self._truncate_for_logging(line),
+                            )
                             continue
+                        logger.debug(
+                            "[QWEN-PARSED] response chunk(full):\n%s",
+                            self._format_json_for_logging(parsed),
+                        )
                         loop.call_soon_threadsafe(queue.put_nowait, parsed)
             except Exception as exc:
+                logger.debug("[QWEN-ERROR] worker raised: %r", exc)
                 loop.call_soon_threadsafe(queue.put_nowait, exc)
             finally:
                 loop.call_soon_threadsafe(queue.put_nowait, sentinel)

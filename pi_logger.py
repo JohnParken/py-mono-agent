@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 
@@ -33,11 +34,16 @@ def _format_message(message: str, extra: dict[str, Any]) -> str:
     return f"{message} [{context}]"
 
 
+def _resolve_log_level() -> int:
+    level_name = os.environ.get("PI_LOG_LEVEL", "INFO").upper()
+    return getattr(logging, level_name, logging.INFO)
+
+
 def get_logger(name: str) -> _PiLogger:
     logger = logging.getLogger(name)
     if not logging.getLogger().handlers:
         logging.basicConfig(
-            level=logging.INFO,
+            level=_resolve_log_level(),
             format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         )
     return _PiLogger(logger)
