@@ -15,6 +15,7 @@ LLM 抽象层
 from __future__ import annotations
 
 import asyncio
+import importlib.resources
 import json
 import logging
 import os
@@ -35,6 +36,7 @@ from typing import (
 )
 
 import requests
+import pi_logger as _pi_logger
 
 from .types import (
     AssistantMessage,
@@ -55,7 +57,52 @@ from .exceptions import (
     AgentValidationError,
 )
 
+getattr(_pi_logger, "configure_logging", lambda *args, **kwargs: None)()
 logger = logging.getLogger(__name__)
+
+
+def _safe_json_dumps(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return str(value)
+
+
+def _truncate_log_text(text: str, limit: int = 240) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...[truncated {len(text) - limit} chars]"
+
+
+def _summarize_tool_call_for_log(tool_call: Any) -> Dict[str, Any]:
+    if isinstance(tool_call, ToolCall):
+        arguments = tool_call.arguments
+        tool_name = tool_call.name
+        tool_id = tool_call.id
+    elif isinstance(tool_call, dict):
+        function_data = tool_call.get("function") or {}
+        arguments = function_data.get("arguments")
+        tool_name = function_data.get("name") or tool_call.get("name", "")
+        tool_id = tool_call.get("id", "")
+    else:
+        arguments = getattr(tool_call, "arguments", None)
+        tool_name = getattr(tool_call, "name", "")
+        tool_id = getattr(tool_call, "id", "")
+
+    argument_keys: List[str] = []
+    if isinstance(arguments, dict):
+        argument_keys = sorted(str(key) for key in arguments.keys())
+
+    return {
+        "id": tool_id,
+        "name": tool_name,
+        "argument_keys": argument_keys,
+        "arguments_preview": _truncate_log_text(_safe_json_dumps(arguments)),
+    }
+
+
+def _summarize_tool_calls_for_log(tool_calls: List[Any]) -> List[Dict[str, Any]]:
+    return [_summarize_tool_call_for_log(tool_call) for tool_call in tool_calls]
 
 
 # =============================================================================
@@ -295,9 +342,25 @@ def validate_tool_arguments(tool: ToolDef, tool_call: ToolCall) -> Any:
         AgentValidationError: 参数验证失败
     """
     try:
+        logger.debug(
+            "[TOOL-VALIDATE] start tool=%s payload=%s",
+            tool.name,
+            _summarize_tool_call_for_log(tool_call),
+        )
         validated = tool.parameters(**tool_call.arguments)
+        logger.debug(
+            "[TOOL-VALIDATE] success tool=%s validated_type=%s",
+            tool.name,
+            type(validated).__name__,
+        )
         return validated
     except Exception as e:
+        logger.warning(
+            "[TOOL-VALIDATE] failed tool=%s payload=%s error=%s",
+            tool.name,
+            _summarize_tool_call_for_log(tool_call),
+            e,
+        )
         raise AgentValidationError(
             f"工具 '{tool.name}' 参数验证失败: {e}",
             field=list(tool_call.arguments.keys()) if tool_call.arguments else None
@@ -441,6 +504,11 @@ class OpenAIProvider:
         }
         if api_tools:
             create_kwargs["tools"] = api_tools
+            logger.debug(
+                "[OPENAI-TOOLS] request tool_count=%s tools=%s",
+                len(api_tools),
+                [tool["function"]["name"] for tool in api_tools],
+            )
 
         # 合并额外参数（排除不应传递给 API 的参数）
         excluded_keys = ("signal", "api_key", "session_id", "user_id", "project_id")
@@ -500,6 +568,21 @@ class OpenAIProvider:
 
                 # 处理工具调用
                 if delta.tool_calls:
+                    logger.debug(
+                        "[OPENAI-TOOLS] delta tool_calls=%s",
+                        _summarize_tool_calls_for_log(
+                            [
+                                {
+                                    "id": tc.id or "",
+                                    "function": {
+                                        "name": tc.function.name if tc.function else "",
+                                        "arguments": tc.function.arguments if tc.function else "",
+                                    },
+                                }
+                                for tc in delta.tool_calls
+                            ]
+                        ),
+                    )
                     for tc in delta.tool_calls:
                         idx = tc.index
                         if idx not in current_tool_calls:
@@ -562,6 +645,10 @@ class OpenAIProvider:
                         if 0 <= ci_offset < len(partial.content):
                             tc_content = partial.content[ci_offset]
                             if isinstance(tc_content, ToolCall):
+                                logger.debug(
+                                    "[OPENAI-TOOLS] completed tool_call=%s",
+                                    _summarize_tool_call_for_log(tc_content),
+                                )
                                 yield StreamToolCallEndEvent(
                                     content_index=ci_offset,
                                     tool_call=tc_content,
@@ -588,6 +675,12 @@ class OpenAIProvider:
                         }
 
                     if finish_reason == "tool_calls":
+                        logger.info(
+                            "[OPENAI-TOOLS] finish_reason=tool_calls tool_calls=%s",
+                            _summarize_tool_calls_for_log(
+                                [c for c in partial.content if isinstance(c, ToolCall)]
+                            ),
+                        )
                         partial.stop_reason = "toolUse"
                     elif finish_reason == "length":
                         partial.stop_reason = "length"
@@ -633,33 +726,18 @@ class QwenLLMProvider:
     DEFAULT_BASE_URL = (
         "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
     )
-    REQUEST_TEMPLATE_JSON = json.dumps(
-        {
-            "token": "",
-            "apikey": "",
-            "type": "txt",
-            "modelId": "light-demo",
-            "appInfo": {
-                "agent_id": "e76d09a-fed2-4ac1-9317-bf419f624c21",
-                "sensitive_judge": False,
-                "safe_model_judge": False,
-                "max_new_tokens": 20480,
-                "temperature": 0.3,
-                "name": "Chat-Medium",
-                "prompt": "(sys_prompt_content)",
-            },
-            "variable": [
-                {
-                    "name": "sys_prompt_content",
-                    "value": "",
-                }
-            ],
-            "data": {
-                "messages": [],
-                "stream": True,
-            },
-        }
-    )
+    REQUEST_TEMPLATE_RESOURCE = "qwen_request_template.json"
+    _request_template_json: Optional[str] = None
+
+    @classmethod
+    def get_request_template_json(cls) -> str:
+        if cls._request_template_json is None:
+            cls._request_template_json = (
+                importlib.resources.files("pi_ai")
+                .joinpath(cls.REQUEST_TEMPLATE_RESOURCE)
+                .read_text(encoding="utf-8")
+            )
+        return cls._request_template_json
 
     def construct_request(
         self,
@@ -674,14 +752,56 @@ class QwenLLMProvider:
 
         基于固定 JSON 模板字符串做深拷贝，仅动态填充 data.messages。
         """
-        template_json = kwargs.pop("request_template_json", self.REQUEST_TEMPLATE_JSON)
+        template_json = kwargs.pop(
+            "request_template_json",
+            self.get_request_template_json(),
+        )
         payload = self._clone_request_template(template_json)
+        resolved_api_key = kwargs.pop("api_key", None) or model.api_key or os.environ.get(
+            "DASHSCOPE_API_KEY", ""
+        )
+        app_api_key = kwargs.pop("app_api_key", None) or os.environ.get(
+            "QWEN_APP_API_KEY", ""
+        )
+        app_info_override = kwargs.pop("app_info", None) or {}
+        payload_override = kwargs.pop("payload_override", None) or {}
+
+        if resolved_api_key:
+            payload["token"] = resolved_api_key
+        if app_api_key:
+            payload["apikey"] = app_api_key
+        payload["modelId"] = model.id
+
+        if app_info_override:
+            payload["appInfo"] = self._deep_merge(
+                payload.get("appInfo", {}),
+                app_info_override,
+            )
+
+        api_tools = self._build_tools(tools) if tools else []
+        prompt_variable_value = self._build_sys_prompt_content(
+            system_prompt=system_prompt,
+            messages=messages,
+            api_tools=api_tools,
+        )
+        payload["variable"] = self._build_variables(
+            prompt_variable_value,
+            payload.get("variable"),
+        )
 
         data = payload.setdefault("data", {})
         data["messages"] = self._build_messages(messages, system_prompt)
 
-        if tools:
-            data["tools"] = self._build_tools(tools)
+        if payload_override:
+            payload = self._deep_merge(payload, payload_override)
+
+        logger.debug(
+            "[QWEN-TOOLS] construct_request model=%s tool_count=%s tools=%s variable_names=%s",
+            model.id,
+            len(api_tools),
+            [tool["function"]["name"] for tool in api_tools],
+            [item.get("name") for item in payload.get("variable", []) if isinstance(item, dict)],
+        )
 
         return payload
 
@@ -706,7 +826,11 @@ class QwenLLMProvider:
         last_preview = ""
         if isinstance(last_content, list) and last_content:
             first_block = last_content[0] or {}
-            last_preview = str(first_block.get("value") or "")[:80]
+            last_preview = str(
+                first_block.get("text")
+                or first_block.get("value")
+                or ""
+            )[:80]
         return {
             "modelId": payload.get("modelId"),
             "type": payload.get("type"),
@@ -714,7 +838,7 @@ class QwenLLMProvider:
             "message_count": len(messages),
             "last_role": last_role,
             "last_preview": last_preview,
-            "tool_count": len(data.get("tools") or []),
+            "tool_count": self._count_tools_from_variables(payload.get("variable")),
             "token": self._mask_secret(payload.get("token")),
             "apikey": self._mask_secret(payload.get("apikey")),
         }
@@ -788,25 +912,30 @@ class QwenLLMProvider:
                 )
 
             elif msg.role == "assistant":
-                assistant_msg: Dict[str, Any] = {
-                    "role": "assistant",
-                    "content": self._build_message_content(msg.content),
-                }
-                tool_calls = []
+                assistant_msg: Dict[str, Any] = {"role": "assistant"}
+                content_parts = self._build_message_content(msg.content)
+                if content_parts:
+                    assistant_msg["content"] = content_parts
+
+                tool_calls_list = []
                 for content in msg.content:
-                    if content.type == "toolCall":
-                        tool_calls.append(
-                            {
-                                "id": content.id,
-                                "type": "function",
-                                "function": {
-                                    "name": content.name,
-                                    "arguments": json.dumps(content.arguments),
-                                },
-                            }
-                        )
-                if tool_calls:
-                    assistant_msg["tool_calls"] = tool_calls
+                    if getattr(content, "type", None) != "toolCall":
+                        continue
+                    tool_calls_list.append(
+                        {
+                            "id": getattr(content, "id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": getattr(content, "name", ""),
+                                "arguments": json.dumps(
+                                    getattr(content, "arguments", {}),
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        }
+                    )
+                if tool_calls_list:
+                    assistant_msg["tool_calls"] = tool_calls_list
                 api_messages.append(assistant_msg)
 
             elif msg.role == "toolResult":
@@ -820,37 +949,280 @@ class QwenLLMProvider:
 
         return api_messages
 
+    def _count_tools_from_variables(self, variables: Any) -> int:
+        if not isinstance(variables, list):
+            return 0
+        for item in variables:
+            if item.get("name") != "tools":
+                continue
+            value = item.get("value")
+            if not isinstance(value, str):
+                continue
+            return value.count('"type": "function"')
+        return 0
+
     def _build_message_content(self, content_blocks: List[Any]) -> List[Dict[str, Any]]:
         parts: List[Dict[str, Any]] = []
         for content in content_blocks:
             if content.type == "text":
-                parts.append({"type": "text", "value": content.text})
+                parts.append({"type": "text", "text": content.text})
             elif content.type == "thinking":
-                parts.append({"type": "text", "value": content.thinking})
+                parts.append({"type": "text", "text": content.thinking})
+            elif content.type == "toolCall":
+                continue
             elif content.type == "image":
                 raise ValueError(
                     "QwenLLMProvider 当前使用文本生成接口，不支持 image content。"
                 )
         return parts
 
+    def _extract_message_text(self, content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: List[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text") or item.get("value") or ""
+                    if text:
+                        parts.append(str(text))
+            return "".join(parts)
+        if isinstance(content, dict):
+            return str(content.get("text") or content.get("value") or "")
+        return str(content)
+
+    def _parse_tool_call_arguments(self, raw_arguments: Any) -> Tuple[Dict[str, Any], str]:
+        if raw_arguments is None:
+            return {}, "{}"
+        if isinstance(raw_arguments, dict):
+            return raw_arguments, json.dumps(raw_arguments, ensure_ascii=False)
+        if isinstance(raw_arguments, str):
+            raw_arguments = self._normalize_tool_call_text(raw_arguments)
+            try:
+                parsed = json.loads(raw_arguments)
+                if isinstance(parsed, dict):
+                    return parsed, raw_arguments
+            except json.JSONDecodeError:
+                return {}, raw_arguments
+            return {}, raw_arguments
+        try:
+            text = json.dumps(raw_arguments, ensure_ascii=False)
+        except TypeError:
+            text = str(raw_arguments)
+        if isinstance(raw_arguments, dict):
+            return raw_arguments, text
+        return {}, text
+
+    def _normalize_tool_call_text(self, text: str) -> str:
+        return (
+            text.replace("\ufeff", "")
+            .replace("\u200b", "")
+            .replace("\u200c", "")
+            .replace("\u200d", "")
+            .replace("\u2060", "")
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .strip()
+        )
+
+    def _extract_json_candidates(self, text: str) -> List[Any]:
+        candidates: List[Any] = []
+        stripped = self._normalize_tool_call_text(text)
+        if not stripped:
+            return candidates
+
+        decoder = json.JSONDecoder()
+        for start, char in enumerate(stripped):
+            if char not in "[{":
+                continue
+            try:
+                value, _ = decoder.raw_decode(stripped[start:])
+            except json.JSONDecodeError:
+                continue
+            candidates.append(value)
+
+        return candidates
+
+    def _normalize_text_tool_call(
+        self,
+        raw_tool_call: Any,
+        available_tool_names: set[str],
+    ) -> Optional[ToolCall]:
+        if not isinstance(raw_tool_call, dict):
+            return None
+
+        function_data = raw_tool_call.get("function") or {}
+        name = (
+            function_data.get("name")
+            or raw_tool_call.get("name")
+            or raw_tool_call.get("tool_name")
+        )
+        if not name or name not in available_tool_names:
+            return None
+
+        raw_arguments = (
+            function_data.get("arguments")
+            if "arguments" in function_data
+            else raw_tool_call.get("arguments", raw_tool_call.get("args", {}))
+        )
+        parsed_arguments, _ = self._parse_tool_call_arguments(raw_arguments)
+        return ToolCall(
+            id=str(raw_tool_call.get("id") or f"call_{uuid.uuid4().hex}"),
+            name=str(name),
+            arguments=parsed_arguments,
+        )
+
+    def _extract_text_tool_calls(
+        self,
+        text: str,
+        tools: Optional[List[ToolDef]],
+    ) -> List[ToolCall]:
+        available_tool_names = {tool.name for tool in (tools or [])}
+        if not available_tool_names:
+            return []
+
+        extracted: List[ToolCall] = []
+        seen_tool_calls: set[Tuple[str, str, str]] = set()
+        for candidate in self._extract_json_candidates(text):
+            raw_tool_calls: List[Any] = []
+            if isinstance(candidate, dict):
+                if isinstance(candidate.get("tool_calls"), list):
+                    raw_tool_calls.extend(candidate["tool_calls"])
+                elif isinstance(candidate.get("tool_call"), dict):
+                    raw_tool_calls.append(candidate["tool_call"])
+                else:
+                    raw_tool_calls.append(candidate)
+            elif isinstance(candidate, list):
+                raw_tool_calls.extend(candidate)
+
+            for raw_tool_call in raw_tool_calls:
+                tool_call = self._normalize_text_tool_call(
+                    raw_tool_call,
+                    available_tool_names,
+                )
+                if tool_call:
+                    dedupe_key = (
+                        tool_call.name,
+                        _safe_json_dumps(tool_call.arguments),
+                    )
+                    if dedupe_key in seen_tool_calls:
+                        continue
+                    seen_tool_calls.add(dedupe_key)
+                    extracted.append(tool_call)
+
+        if extracted:
+            logger.info(
+                "[QWEN-TOOLS] parsed text tool_calls=%s",
+                _summarize_tool_calls_for_log(extracted),
+            )
+        return extracted
+
+    async def _emit_qwen_tool_call(
+        self,
+        partial: AssistantMessage,
+        tool_call_obj: ToolCall,
+    ) -> AsyncGenerator[AssistantMessageEvent, None]:
+        partial.content.append(tool_call_obj)
+        content_index = len(partial.content) - 1
+        yield StreamToolCallStartEvent(
+            content_index=content_index,
+            partial=partial,
+        )
+        yield StreamToolCallDeltaEvent(
+            content_index=content_index,
+            delta=json.dumps(tool_call_obj.arguments, ensure_ascii=False),
+            partial=partial,
+        )
+        yield StreamToolCallEndEvent(
+            content_index=content_index,
+            tool_call=tool_call_obj,
+            partial=partial,
+        )
+
     def _build_variables(
         self,
-        system_prompt: str,
+        tools_prompt_content: str,
         variables_override: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
-        variables = [{"name": "sys_prompt_content", "value": system_prompt or ""}]
+        variables = [{"name": "tools", "value": tools_prompt_content or ""}]
         if not variables_override:
             return variables
 
         copied = self._deep_copy_json_value(variables_override)
         has_system_var = False
         for item in copied:
-            if item.get("name") == "sys_prompt_content":
-                item["value"] = system_prompt or ""
+            if item.get("name") == "tools":
+                item["value"] = tools_prompt_content or ""
                 has_system_var = True
         if not has_system_var:
-            copied.append({"name": "sys_prompt_content", "value": system_prompt or ""})
+            copied.append({"name": "tools", "value": tools_prompt_content or ""})
         return copied
+
+    def _build_sys_prompt_content(
+        self,
+        system_prompt: str,
+        messages: List[Any],
+        api_tools: List[Dict[str, Any]],
+    ) -> str:
+        sections: List[str] = []
+
+        if system_prompt:
+            sections.append(system_prompt)
+
+        if api_tools:
+            sections.append(
+                "Tools description:\n"
+                + json.dumps(api_tools, ensure_ascii=False, indent=2)
+                + "\n\n"
+                "When a tool is needed, respond only with one or more tool call "
+                "JSON objects inside <tool_call></tool_call> tags. "
+                "Each JSON object must use this shape: "
+                '{"name":"<tool-name>","arguments":{...}}. '
+                "Do not invent tool names or arguments that are not described above."
+            )
+
+        tool_interactions: List[Dict[str, Any]] = []
+        for message in messages:
+            if getattr(message, "role", None) == "assistant":
+                for content in getattr(message, "content", []) or []:
+                    if getattr(content, "type", None) == "toolCall":
+                        tool_interactions.append(
+                            {
+                                "kind": "toolCall",
+                                "id": content.id,
+                                "name": content.name,
+                                "arguments": content.arguments,
+                            }
+                        )
+            elif getattr(message, "role", None) == "toolResult":
+                tool_interactions.append(
+                    {
+                        "kind": "toolResult",
+                        "tool_call_id": getattr(message, "tool_call_id", ""),
+                        "tool_name": getattr(message, "tool_name", ""),
+                        "is_error": getattr(message, "is_error", False),
+                        "content": [
+                            {
+                                "type": getattr(content, "type", None),
+                                "text": getattr(content, "text", ""),
+                            }
+                            for content in (getattr(message, "content", []) or [])
+                            if getattr(content, "type", None) == "text"
+                        ],
+                    }
+                )
+
+        if tool_interactions:
+            sections.append(
+                "Tool interactions:\n"
+                + json.dumps(tool_interactions, ensure_ascii=False, indent=2)
+            )
+
+        return "\n\n".join(section for section in sections if section)
 
     def _build_tools(self, tools: List[ToolDef]) -> List[Dict[str, Any]]:
         api_tools = []
@@ -913,6 +1285,7 @@ class QwenLLMProvider:
             messages=messages,
             system_prompt=system_prompt,
             tools=tools,
+            api_key=key,
             **kwargs,
         )
 
@@ -1004,6 +1377,7 @@ class QwenLLMProvider:
                             text_block = partial.content[text_index]
                             if isinstance(text_block, TextContent):
                                 final_text = text_block.text
+                        text_tool_calls = self._extract_text_tool_calls(final_text, tools)
                         logger.debug(
                             "[QWEN-STREAM] completed-via-status total_text_len=%s usage=%s",
                             len(final_text),
@@ -1016,7 +1390,18 @@ class QwenLLMProvider:
                             content=final_text,
                             partial=partial,
                         )
-                        partial.stop_reason = "stop"
+                        for tool_call_obj in text_tool_calls:
+                            async for tool_event in self._emit_qwen_tool_call(
+                                partial,
+                                tool_call_obj,
+                            ):
+                                yield tool_event
+                        partial.stop_reason = "toolUse" if text_tool_calls else "stop"
+                        if text_tool_calls:
+                            logger.info(
+                                "[QWEN-TOOLS] completed-via-status tool_calls=%s",
+                                _summarize_tool_calls_for_log(text_tool_calls),
+                            )
                         yield StreamDoneEvent(reason=partial.stop_reason, message=partial)
                         return
 
@@ -1024,8 +1409,8 @@ class QwenLLMProvider:
 
                 output = chunk_data.get("output") or {}
                 choice = (output.get("choices") or [{}])[0]
-                message = choice.get("message") or {}
-                finish_reason = choice.get("finish_reason") or output.get("finish_reason") or "stop"
+                message = choice.get("message") or choice.get("delta") or {}
+                finish_reason = choice.get("finish_reason") or output.get("finish_reason")
 
                 reasoning_text = (
                     message.get("reasoning_content")
@@ -1054,7 +1439,7 @@ class QwenLLMProvider:
                         partial=partial,
                     )
 
-                content_text = message.get("content") or ""
+                content_text = self._extract_message_text(message.get("content"))
                 if content_text:
                     if text_index is None:
                         partial.content.append(TextContent(text=""))
@@ -1071,15 +1456,25 @@ class QwenLLMProvider:
 
                 tool_calls = message.get("tool_calls") or []
                 for tool_call in tool_calls:
+                    logger.debug(
+                        "[QWEN-TOOLS] chunk tool_call=%s finish_reason=%s",
+                        _summarize_tool_call_for_log(tool_call),
+                        finish_reason,
+                    )
                     function_data = tool_call.get("function") or {}
-                    raw_arguments = function_data.get("arguments") or "{}"
-                    try:
-                        parsed_arguments = json.loads(raw_arguments)
-                    except json.JSONDecodeError:
-                        parsed_arguments = {}
+                    tool_name = function_data.get("name") or tool_call.get("name", "")
+                    if not tool_name:
+                        logger.warning(
+                            "[QWEN-TOOLS] skipped blank tool_call raw=%s",
+                            _summarize_tool_call_for_log(tool_call),
+                        )
+                        continue
+                    parsed_arguments, raw_arguments_text = self._parse_tool_call_arguments(
+                        function_data.get("arguments")
+                    )
                     tool_call_obj = ToolCall(
                         id=tool_call.get("id", ""),
-                        name=function_data.get("name", ""),
+                        name=tool_name,
                         arguments=parsed_arguments,
                     )
                     partial.content.append(tool_call_obj)
@@ -1090,7 +1485,7 @@ class QwenLLMProvider:
                     )
                     yield StreamToolCallDeltaEvent(
                         content_index=content_index,
-                        delta=raw_arguments,
+                        delta=raw_arguments_text,
                         partial=partial,
                     )
                     yield StreamToolCallEndEvent(
@@ -1121,6 +1516,23 @@ class QwenLLMProvider:
                     partial.usage,
                 )
 
+                if not finish_reason:
+                    continue
+
+                existing_tool_calls = [
+                    c for c in partial.content if isinstance(c, ToolCall)
+                ]
+                text_tool_calls: List[ToolCall] = []
+                if not existing_tool_calls and text_index is not None:
+                    text_block = partial.content[text_index]
+                    final_text_for_tools = (
+                        text_block.text if isinstance(text_block, TextContent) else ""
+                    )
+                    text_tool_calls = self._extract_text_tool_calls(
+                        final_text_for_tools,
+                        tools,
+                    )
+
                 if text_index is not None:
                     text_block = partial.content[text_index]
                     final_text = text_block.text if isinstance(text_block, TextContent) else ""
@@ -1130,7 +1542,21 @@ class QwenLLMProvider:
                         partial=partial,
                     )
 
-                if finish_reason == "tool_calls":
+                for tool_call_obj in text_tool_calls:
+                    async for tool_event in self._emit_qwen_tool_call(
+                        partial,
+                        tool_call_obj,
+                    ):
+                        yield tool_event
+
+                if finish_reason == "tool_calls" or text_tool_calls:
+                    logger.info(
+                        "[QWEN-TOOLS] stop=toolUse finish_reason=%s tool_calls=%s",
+                        finish_reason,
+                        _summarize_tool_calls_for_log(
+                            [c for c in partial.content if isinstance(c, ToolCall)]
+                        ),
+                    )
                     partial.stop_reason = "toolUse"
                 elif finish_reason == "length":
                     partial.stop_reason = "length"
@@ -1146,15 +1572,23 @@ class QwenLLMProvider:
                 return
 
             if not completed:
+                text_tool_calls: List[ToolCall] = []
                 if text_index is not None:
                     text_block = partial.content[text_index]
                     final_text = text_block.text if isinstance(text_block, TextContent) else ""
+                    text_tool_calls = self._extract_text_tool_calls(final_text, tools)
                     yield StreamTextEndEvent(
                         content_index=text_index,
                         content=final_text,
                         partial=partial,
                     )
-                partial.stop_reason = "stop"
+                for tool_call_obj in text_tool_calls:
+                    async for tool_event in self._emit_qwen_tool_call(
+                        partial,
+                        tool_call_obj,
+                    ):
+                        yield tool_event
+                partial.stop_reason = "toolUse" if text_tool_calls else "stop"
                 logger.debug(
                     "[QWEN-STREAM] ended-without-explicit-completed content_count=%s",
                     len(partial.content),
@@ -1364,6 +1798,15 @@ async def stream_simple(
     system_prompt = context.get("system_prompt", "")
     messages = context.get("messages", [])
     tools = context.get("tools", None)
+
+    logger.debug(
+        "[LLM-STREAM] provider=%s model=%s messages=%s tool_count=%s tool_names=%s",
+        model.provider,
+        model.id,
+        len(messages),
+        len(tools or []),
+        [tool.name for tool in (tools or [])],
+    )
 
     async def _generate():
         async for event in provider.stream(

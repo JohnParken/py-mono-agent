@@ -301,6 +301,7 @@ class AgentLoopConfig:
         reasoning: 可选，思考级别
         api_key: 可选，静态 API Key
         session_id: 可选，会话标识
+        max_tool_iterations: 单次 Agent 运行允许的最大连续工具循环数
         max_retry_delay_ms: 可选，最大重试等待时间
         # Credit tracking 配置
         enable_credit_tracking: 是否启用 credit 计费追踪
@@ -329,6 +330,7 @@ class AgentLoopConfig:
     reasoning: Optional[str] = None
     api_key: Optional[str] = None
     session_id: Optional[str] = None
+    max_tool_iterations: int = 10
     max_retry_delay_ms: Optional[int] = None
     # Credit tracking
     enable_credit_tracking: bool = False

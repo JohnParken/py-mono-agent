@@ -1,0 +1,25 @@
+{
+  "token": "",
+  "apikey": "",
+  "type": "txt",
+  "modelId": "light-demo",
+  "appInfo": {
+    "agent_id": "e76d09a-fed2-4ac1-9317-bf419f624c21",
+    "sensitive_judge": false,
+    "safe_model_judge": false,
+    "max_new_tokens": 20480,
+    "temperature": 0.3,
+    "name": "Chat-Medium",
+    "prompt": "(tools)"
+  },
+  "variable": [
+    {
+      "name": "tools",
+      "value": ""
+    }
+  ],
+  "data": {
+    "messages": [],
+    "stream": true
+  }
+}

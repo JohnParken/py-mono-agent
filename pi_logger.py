@@ -39,11 +39,19 @@ def _resolve_log_level() -> int:
     return getattr(logging, level_name, logging.INFO)
 
 
-def get_logger(name: str) -> _PiLogger:
-    logger = logging.getLogger(name)
-    if not logging.getLogger().handlers:
+def configure_logging(level: int | None = None) -> None:
+    resolved_level = _resolve_log_level() if level is None else level
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
         logging.basicConfig(
-            level=_resolve_log_level(),
+            level=resolved_level,
             format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         )
+    else:
+        root_logger.setLevel(resolved_level)
+
+
+def get_logger(name: str) -> _PiLogger:
+    configure_logging()
+    logger = logging.getLogger(name)
     return _PiLogger(logger)

@@ -39,6 +39,7 @@ Rules:
 - Be explicit about what you changed and why.
 - Do not invent file contents you have not read.
 - Prefer small, precise edits over whole-file rewrites unless necessary.
+- When writing multiline files with write_file, prefer content_lines over content.
 """
 
 

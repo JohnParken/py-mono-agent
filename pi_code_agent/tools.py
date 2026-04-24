@@ -73,7 +73,17 @@ class ReadArgs(BaseModel):
 
 class WriteArgs(BaseModel):
     path: str = Field(description="File path relative to the workspace root.")
-    content: str = Field(description="Full file contents to write.")
+    content: str | None = Field(
+        default=None,
+        description="Full file contents to write. For multiline files, prefer content_lines.",
+    )
+    content_lines: List[str] | None = Field(
+        default=None,
+        description=(
+            "Alternative to content: file lines joined with newline characters. "
+            "Use this for multiline content to avoid JSON string escaping issues."
+        ),
+    )
     append: bool = Field(default=False, description="Append instead of overwriting.")
     create_directories: bool = Field(
         default=True,
@@ -190,7 +200,7 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
             tool_call_id,
             args.path,
             args.append,
-            len(args.content),
+            len(_get_write_content(args)),
         )
         path = workspace.resolve_path(args.path, allow_root=False)
         if path.exists() and path.is_dir():
@@ -202,17 +212,18 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
                 f"Parent directory does not exist: {workspace.display_path(path.parent)}"
             )
         mode = "a" if args.append else "w"
+        content = _get_write_content(args)
         with path.open(mode, encoding="utf-8") as handle:
-            handle.write(args.content)
+            handle.write(content)
         action = "Appended to" if args.append else "Wrote"
         logger.info(
             "[CODE-TOOL] write_file success path=%s action=%s content_len=%s",
             workspace.display_path(path),
             action,
-            len(args.content),
+            len(content),
         )
         return _result(
-            f"{action} {workspace.display_path(path)} ({len(args.content)} characters)."
+            f"{action} {workspace.display_path(path)} ({len(content)} characters)."
         )
 
     async def edit_file(
@@ -447,6 +458,18 @@ def _walk_workspace(path: Path, *, recursive: bool, max_entries: int) -> list[Pa
         if len(entries) >= max_entries:
             break
     return entries
+
+
+def _get_write_content(args: WriteArgs) -> str:
+    has_content = args.content is not None
+    has_content_lines = args.content_lines is not None
+    if has_content and has_content_lines:
+        raise ValueError("Provide either content or content_lines, not both.")
+    if has_content_lines:
+        return "\n".join(args.content_lines or [])
+    if has_content:
+        return args.content or ""
+    raise ValueError("write_file requires content or content_lines.")
 
 
 def _should_skip(path: Path) -> bool:

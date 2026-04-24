@@ -15,8 +15,10 @@ import asyncio
 import copy
 import inspect
 import logging
+import json
 import time
 from typing import Any, Dict, List, Optional
+import pi_logger as _pi_logger
 
 from pi_ai import (
     EventStream,
@@ -43,7 +45,52 @@ try:
 except ImportError:
     CREDIT_TRACKING_AVAILABLE = False
 
+getattr(_pi_logger, "configure_logging", lambda *args, **kwargs: None)()
 logger = logging.getLogger(__name__)
+
+
+def _truncate_log_text(text: str, limit: int = 240) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}...[truncated {len(text) - limit} chars]"
+
+
+def _summarize_tool_call_for_log(tool_call: ToolCall) -> Dict[str, Any]:
+    arguments = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
+    return {
+        "id": tool_call.id,
+        "name": tool_call.name,
+        "argument_keys": sorted(str(key) for key in arguments.keys()),
+        "arguments_preview": _truncate_log_text(str(tool_call.arguments)),
+    }
+
+
+def _summarize_tool_result_for_log(result: Any) -> Dict[str, Any]:
+    content = getattr(result, "content", []) or []
+    text_parts = [
+        c.text for c in content
+        if getattr(c, "type", None) == "text" and getattr(c, "text", None)
+    ]
+    return {
+        "content_blocks": len(content),
+        "text_preview": _truncate_log_text("\n".join(text_parts)),
+        "details_type": type(getattr(result, "details", None)).__name__,
+    }
+
+
+def _tool_call_signature(tool_call: ToolCall) -> str:
+    try:
+        arguments = json.dumps(tool_call.arguments, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        arguments = str(tool_call.arguments)
+    return f"{tool_call.name}:{arguments}"
+
+
+def _create_safety_message(text: str) -> AssistantMessage:
+    return AssistantMessage(
+        content=[TextContent(text=text)],
+        stop_reason="stop",
+    )
 
 
 # =============================================================================
@@ -262,6 +309,8 @@ async def _run_loop(
     - 内层循环: 处理工具调用和 steering 消息
     """
     first_turn = True
+    tool_iteration_count = 0
+    previous_tool_signature: Optional[str] = None
 
     # 检查是否有 steering 消息（用户可能在等待期间输入了内容）
     pending_messages: List[AgentMessage] = []
@@ -314,6 +363,52 @@ async def _run_loop(
 
             tool_results: List[ToolResultMessage] = []
             if has_more_tool_calls:
+                tool_iteration_count += 1
+                current_signature = "|".join(
+                    _tool_call_signature(tool_call) for tool_call in tool_calls
+                )
+
+                if tool_iteration_count > config.max_tool_iterations:
+                    safety_message = _create_safety_message(
+                        "Stopped tool execution because the model exceeded "
+                        f"the maximum of {config.max_tool_iterations} consecutive "
+                        "tool-call iterations. Please summarize what has already "
+                        "been done before requesting more tool calls."
+                    )
+                    logger.warning(
+                        "[AGENT-TOOLS] stopping loop max_tool_iterations=%s last_tool_calls=%s",
+                        config.max_tool_iterations,
+                        [_summarize_tool_call_for_log(tool_call) for tool_call in tool_calls],
+                    )
+                    current_context.messages.append(safety_message)
+                    new_messages.append(safety_message)
+                    stream.push(MessageStartEvent(message=copy.copy(safety_message)))
+                    stream.push(MessageEndEvent(message=safety_message))
+                    stream.push(TurnEndEvent(message=safety_message, tool_results=[]))
+                    stream.push(AgentEndEvent(messages=new_messages))
+                    stream.end(new_messages)
+                    return
+
+                if previous_tool_signature == current_signature:
+                    safety_message = _create_safety_message(
+                        "Stopped tool execution because the model repeated the same "
+                        "tool call with the same arguments. Please inspect the latest "
+                        "tool result and continue without repeating it."
+                    )
+                    logger.warning(
+                        "[AGENT-TOOLS] stopping loop repeated_tool_calls=%s",
+                        [_summarize_tool_call_for_log(tool_call) for tool_call in tool_calls],
+                    )
+                    current_context.messages.append(safety_message)
+                    new_messages.append(safety_message)
+                    stream.push(MessageStartEvent(message=copy.copy(safety_message)))
+                    stream.push(MessageEndEvent(message=safety_message))
+                    stream.push(TurnEndEvent(message=safety_message, tool_results=[]))
+                    stream.push(AgentEndEvent(messages=new_messages))
+                    stream.end(new_messages)
+                    return
+
+                previous_tool_signature = current_signature
                 tool_execution = await _execute_tool_calls(
                     current_context.tools,
                     message,
@@ -327,6 +422,9 @@ async def _run_loop(
                 for result in tool_results:
                     current_context.messages.append(result)
                     new_messages.append(result)
+            else:
+                tool_iteration_count = 0
+                previous_tool_signature = None
 
             stream.push(TurnEndEvent(message=message, tool_results=tool_results))
 
@@ -574,6 +672,12 @@ async def _execute_tool_calls(
     results: List[ToolResultMessage] = []
     steering_messages: Optional[List[AgentMessage]] = None
 
+    logger.info(
+        "[AGENT-TOOLS] executing tool_calls count=%s tool_calls=%s",
+        len(tool_calls),
+        [_summarize_tool_call_for_log(tool_call) for tool_call in tool_calls],
+    )
+
     for index, tool_call in enumerate(tool_calls):
         # 检查取消
         if cancel_event and cancel_event.is_set():
@@ -585,6 +689,13 @@ async def _execute_tool_calls(
         tool = None
         if tools:
             tool = next((t for t in tools if t.name == tool_call.name), None)
+
+        logger.info(
+            "[AGENT-TOOLS] start tool=%s tool_call=%s tool_found=%s",
+            tool_call.name,
+            _summarize_tool_call_for_log(tool_call),
+            bool(tool),
+        )
 
         stream.push(
             ToolExecutionStartEvent(
@@ -602,8 +713,18 @@ async def _execute_tool_calls(
                 raise RuntimeError(f"Tool '{tool_call.name}' not found")
 
             validated_args = validate_tool_arguments(tool, tool_call)
+            logger.debug(
+                "[AGENT-TOOLS] validated tool=%s args_type=%s",
+                tool_call.name,
+                type(validated_args).__name__,
+            )
 
             def on_update(partial_result: AgentToolResult):
+                logger.debug(
+                    "[AGENT-TOOLS] update tool=%s partial=%s",
+                    tool_call.name,
+                    _summarize_tool_result_for_log(partial_result),
+                )
                 stream.push(
                     ToolExecutionUpdateEvent(
                         tool_call_id=tool_call.id,
@@ -616,8 +737,19 @@ async def _execute_tool_calls(
             result = await tool.execute(
                 tool_call.id, validated_args, cancel_event, on_update
             )
+            logger.info(
+                "[AGENT-TOOLS] success tool=%s result=%s",
+                tool_call.name,
+                _summarize_tool_result_for_log(result),
+            )
 
         except Exception as e:
+            logger.warning(
+                "[AGENT-TOOLS] failed tool=%s tool_call=%s error=%s",
+                tool_call.name,
+                _summarize_tool_call_for_log(tool_call),
+                e,
+            )
             result = AgentToolResult(
                 content=[TextContent(text=str(e))],
                 details={},
@@ -644,6 +776,12 @@ async def _execute_tool_calls(
         results.append(tool_result_message)
         stream.push(MessageStartEvent(message=tool_result_message))
         stream.push(MessageEndEvent(message=tool_result_message))
+        logger.debug(
+            "[AGENT-TOOLS] tool_result_message tool=%s is_error=%s summary=%s",
+            tool_call.name,
+            is_error,
+            _summarize_tool_result_for_log(tool_result_message),
+        )
 
         # 检查 steering 消息——如果用户中断则跳过剩余工具
         if get_steering_messages:
@@ -670,6 +808,12 @@ def _skip_tool_call(
     result = AgentToolResult(
         content=[TextContent(text="Skipped due to queued user message.")],
         details={},
+    )
+
+    logger.info(
+        "[AGENT-TOOLS] skipped tool=%s tool_call=%s",
+        tool_call.name,
+        _summarize_tool_call_for_log(tool_call),
     )
 
     stream.push(
