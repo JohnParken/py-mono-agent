@@ -11,6 +11,7 @@ import asyncio
 import copy
 import inspect
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import (
@@ -50,6 +51,8 @@ from .types import (
     AgentToolResult,
     StreamFn,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -100,10 +103,10 @@ class AgentOptions:
     strict_tool_arguments: bool = False
     static_memory: str = ""
     enable_context_memory: bool = True
-    context_recent_messages: int = 12
-    context_tool_results_to_keep: int = 6
-    context_max_tokens: int = 12000
-    context_summary_max_chars: int = 6000
+    context_recent_messages: int = 20
+    context_tool_results_to_keep: int = 8
+    context_max_tokens: int = 32000
+    context_summary_max_chars: int = 12000
     max_retry_delay_ms: Optional[int] = None
     # Credit tracking
     enable_credit_tracking: bool = False
@@ -223,10 +226,20 @@ class Agent:
                 parts.append(f"[tool_call] {tool_name} {args_text}")
         return "\n".join(part for part in parts if part).strip()
 
+    def _estimate_text_tokens(self, text: str) -> int:
+        """估算文本的 token 数量，对中文更友好。"""
+        if not text:
+            return 0
+        # 中文字符（CJK）约 1.5 token/字，英文/数字/标点约 0.25 token/字
+        cjk_count = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff' or '\u3400' <= ch <= '\u4dbf' or '\uf900' <= ch <= '\ufaff')
+        other_count = len(text) - cjk_count
+        return max(1, int(cjk_count * 1.5 + other_count * 0.25))
+
     def _estimate_message_tokens(self, message: AgentMessage) -> int:
         role = str(getattr(message, "role", "") or "")
         text = self._extract_message_text(message)
-        return max(8, (len(role) // 4) + (len(text) // 4) + 8)
+        # 角色标记 + 文本内容 + 消息结构开销（JSON 格式、分隔符等）
+        return max(8, self._estimate_text_tokens(role) + self._estimate_text_tokens(text) + 12)
 
     def _estimate_messages_tokens(self, messages: List[AgentMessage]) -> int:
         return sum(self._estimate_message_tokens(message) for message in messages)
@@ -234,11 +247,30 @@ class Agent:
     def _truncate_text_by_tokens(self, text: str, token_budget: int) -> str:
         if token_budget <= 0:
             return ""
-        max_chars = max(64, token_budget * 4)
+        # 使用更精确的字符预算：混合文本按平均 0.8 token/字估算
+        max_chars = max(64, int(token_budget / 0.8))
         if len(text) <= max_chars:
             return text
         clipped = text[:max_chars].rstrip()
         return clipped + "\n...[summary truncated by context budget]"
+
+    _KEYWORD_PRIORITY_PATTERNS = (
+        "不要", "禁止", "必须", "一定", "务必", "只能", "仅",
+        "不要修改", "不要删除", "不要创建", "必须保留",
+        "must", "must not", "only", "never", "always", "do not",
+        "don't", "should not", "required", "forbidden",
+    )
+
+    def _is_high_priority_message(self, message: AgentMessage) -> bool:
+        """判断消息是否包含高优先级的用户约束/要求。"""
+        role = getattr(message, "role", "")
+        if role != "user":
+            return False
+        text = self._extract_message_text(message)
+        if not text:
+            return False
+        text_lower = text.lower()
+        return any(kw.lower() in text_lower for kw in self._KEYWORD_PRIORITY_PATTERNS)
 
     def _build_structured_memory_summary(
         self,
@@ -248,17 +280,25 @@ class Agent:
         if not older_messages:
             return ""
 
+        priority_notes: List[str] = []
         user_notes: List[str] = []
         assistant_notes: List[str] = []
         tool_notes: List[str] = []
 
-        for message in older_messages[-40:]:
+        for message in older_messages[-60:]:
             role = getattr(message, "role", "")
             text = self._extract_message_text(message)
             if not text:
                 continue
-            compact = " ".join(text.split())[:300]
-            if role == "user":
+
+            # 高优先级消息保留更完整的内容（600 字符 vs 300 字符）
+            is_priority = self._is_high_priority_message(message)
+            max_len = 600 if is_priority else 300
+            compact = " ".join(text.split())[:max_len]
+
+            if is_priority:
+                priority_notes.append(f"[IMPORTANT] {compact}")
+            elif role == "user":
                 user_notes.append(compact)
             elif role == "assistant":
                 assistant_notes.append(compact)
@@ -274,20 +314,23 @@ class Agent:
                 continue
             prefix = "error" if getattr(message, "is_error", False) else "ok"
             tool_name = getattr(message, "tool_name", "")
-            recent_tool_lines.append(f"[{prefix}] {tool_name}: {' '.join(text.split())[:240]}")
+            recent_tool_lines.append(f"[{prefix}] {tool_name}: {' '.join(text.split())[:360]}")
 
         sections: List[str] = [
             "[MEMORY SUMMARY]",
-            "Use this as compressed history. Prioritize these facts over re-asking old questions.",
+            "This is your compressed conversation history. Prioritize these facts over re-asking old questions. "
+            "If the user previously stated constraints or requirements, you MUST continue to honor them.",
         ]
+        if priority_notes:
+            sections.append("User Constraints & Requirements (DO NOT FORGET):\n- " + "\n- ".join(priority_notes[-10:]))
         if user_notes:
-            sections.append("User Facts:\n- " + "\n- ".join(user_notes[-8:]))
+            sections.append("User Facts:\n- " + "\n- ".join(user_notes[-10:]))
         if assistant_notes:
             sections.append("Assistant Progress:\n- " + "\n- ".join(assistant_notes[-8:]))
         if tool_notes:
             sections.append("Historical Tool Findings:\n- " + "\n- ".join(tool_notes[-8:]))
         if recent_tool_lines:
-            sections.append("Latest Tool Findings:\n- " + "\n- ".join(recent_tool_lines[-6:]))
+            sections.append("Latest Tool Findings:\n- " + "\n- ".join(recent_tool_lines[-8:]))
 
         summary = "\n\n".join(sections).strip()
         if len(summary) > self._context_summary_max_chars:
@@ -303,7 +346,10 @@ class Agent:
         if not messages:
             return messages
 
-        if self._estimate_messages_tokens(messages) <= self._context_max_tokens:
+        original_count = len(messages)
+        original_tokens = self._estimate_messages_tokens(messages)
+
+        if original_tokens <= self._context_max_tokens:
             return messages
 
         split_index = max(0, len(messages) - self._context_recent_messages)
@@ -330,24 +376,44 @@ class Agent:
 
         summary_text = self._build_structured_memory_summary(older_messages, latest_tool_results)
         if summary_text:
-            summary_message = UserMessage(content=[TextContent(text=summary_text)])
+            # 使用更醒目的格式包装摘要，使其更像 system instruction
+            formatted_summary = (
+                "[CONTEXT MEMORY — READ CAREFULLY]\n\n"
+                + summary_text
+                + "\n\n[END CONTEXT MEMORY — Resume current conversation below]"
+            )
+            summary_message = UserMessage(content=[TextContent(text=formatted_summary)])
             transformed: List[AgentMessage] = [summary_message] + retained_messages
         else:
             transformed = retained_messages
 
+        dropped_count = 0
         while len(transformed) > 1 and self._estimate_messages_tokens(transformed) > self._context_max_tokens:
             removal_index = 1 if summary_text else 0
             if removal_index >= len(transformed):
                 break
             transformed.pop(removal_index)
+            dropped_count += 1
 
         if summary_text and transformed:
             current_tokens = self._estimate_messages_tokens(transformed)
             if current_tokens > self._context_max_tokens:
                 overflow = current_tokens - self._context_max_tokens
                 summary_token_budget = max(128, self._estimate_message_tokens(transformed[0]) - overflow)
-                clipped_summary = self._truncate_text_by_tokens(summary_text, summary_token_budget)
+                clipped_summary = self._truncate_text_by_tokens(formatted_summary, summary_token_budget)
                 transformed[0] = UserMessage(content=[TextContent(text=clipped_summary)])
+
+        final_tokens = self._estimate_messages_tokens(transformed)
+        logger.debug(
+            "[AGENT-MEMORY] context_transformed original=%s->%s msgs, "
+            "tokens=%s->%s, dropped=%s, summary=%s chars",
+            original_count,
+            len(transformed),
+            original_tokens,
+            final_tokens,
+            dropped_count,
+            len(summary_text) if summary_text else 0,
+        )
 
         return transformed
 

@@ -832,6 +832,97 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1].type, "done")
         self.assertEqual(events[-1].reason, "stop")
 
+    def test_extract_text_tool_calls_parses_multiple_tool_call_blocks(self):
+        text = (
+            '<tool_call>{"name":"echo","arguments":{"text":"hello"}}</tool_call>\n'
+            '<tool_call>{"name":"echo","arguments":{"text":"world"}}</tool_call>'
+        )
+
+        tool_calls = self.provider._extract_text_tool_calls(text, [DummyTool()])
+
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0].name, "echo")
+        self.assertEqual(tool_calls[0].arguments, {"text": "hello"})
+        self.assertEqual(tool_calls[1].name, "echo")
+        self.assertEqual(tool_calls[1].arguments, {"text": "world"})
+
+    def test_extract_text_tool_calls_parses_markdown_wrapped_tool_calls(self):
+        text = (
+            '<tool_call>\n```json\n'
+            '{"name":"echo","arguments":{"text":"markdown"}}\n'
+            '```\n</tool_call>'
+        )
+
+        tool_calls = self.provider._extract_text_tool_calls(text, [DummyTool()])
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].name, "echo")
+        self.assertEqual(tool_calls[0].arguments, {"text": "markdown"})
+
+    def test_extract_text_tool_calls_parses_multiple_markdown_wrapped_tool_calls(self):
+        text = (
+            '<tool_call>\n```json\n'
+            '{"name":"echo","arguments":{"text":"first"}}\n'
+            '```\n</tool_call>\n'
+            '<tool_call>\n```json\n'
+            '{"name":"echo","arguments":{"text":"second"}}\n'
+            '```\n</tool_call>'
+        )
+
+        tool_calls = self.provider._extract_text_tool_calls(text, [DummyTool()])
+
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0].arguments, {"text": "first"})
+        self.assertEqual(tool_calls[1].arguments, {"text": "second"})
+
+    async def test_stream_extracts_multiple_text_tool_calls(self):
+        chunks = [
+            {
+                "output": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '<tool_call>{"name":"echo","arguments":{"text":"hello"}}</tool_call>\n'
+                                    '<tool_call>{"name":"echo","arguments":{"text":"world"}}</tool_call>'
+                                ),
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            },
+        ]
+
+        async def fake_stream_request(**kwargs):
+            for chunk in chunks:
+                yield chunk
+
+        self.provider._stream_request = fake_stream_request
+
+        events = []
+        async for event in self.provider.stream(
+            model=self.model,
+            messages=[],
+            system_prompt="You are a tool-using assistant.",
+            tools=[DummyTool()],
+            api_key="dash-token",
+        ):
+            events.append(event)
+
+        done_event = events[-1]
+        self.assertEqual(done_event.type, "done")
+        self.assertEqual(done_event.reason, "toolUse")
+
+        tool_calls = [
+            content for content in done_event.message.content if isinstance(content, ToolCall)
+        ]
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0].name, "echo")
+        self.assertEqual(tool_calls[0].arguments, {"text": "hello"})
+        self.assertEqual(tool_calls[1].name, "echo")
+        self.assertEqual(tool_calls[1].arguments, {"text": "world"})
+
 
 if __name__ == "__main__":
     unittest.main()

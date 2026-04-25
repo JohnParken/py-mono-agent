@@ -20,6 +20,7 @@ import importlib.resources
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -1272,6 +1273,19 @@ class QwenLLMProvider:
             parse_error=parse_error,
         )
 
+    def _strip_markdown_fences(self, text: str) -> str:
+        """Remove markdown code block fences from text."""
+        text = text.strip()
+        if text.startswith("```"):
+            first_newline = text.find("\n")
+            if first_newline != -1:
+                text = text[first_newline + 1 :]
+            else:
+                text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        return text.strip()
+
     def _extract_text_tool_calls(
         self,
         text: str,
@@ -1283,32 +1297,60 @@ class QwenLLMProvider:
 
         extracted: List[ToolCall] = []
         seen_tool_calls: set[Tuple[str, str, str]] = set()
-        for candidate in self._extract_json_candidates(text):
-            raw_tool_calls: List[Any] = []
-            if isinstance(candidate, dict):
-                if isinstance(candidate.get("tool_calls"), list):
-                    raw_tool_calls.extend(candidate["tool_calls"])
-                elif isinstance(candidate.get("tool_call"), dict):
-                    raw_tool_calls.append(candidate["tool_call"])
-                else:
-                    raw_tool_calls.append(candidate)
-            elif isinstance(candidate, list):
-                raw_tool_calls.extend(candidate)
+        normalized_text = self._normalize_tool_call_text(text)
 
-            for raw_tool_call in raw_tool_calls:
-                tool_call = self._normalize_text_tool_call(
-                    raw_tool_call,
-                    available_tool_names,
-                )
-                if tool_call:
-                    dedupe_key = (
-                        tool_call.name,
-                        _safe_json_dumps(tool_call.arguments),
+        # Strategy 1: Extract from <tool_call>...</tool_call> tags (supports multiple)
+        tool_call_pattern = re.compile(
+            r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL
+        )
+        tag_matches = tool_call_pattern.findall(normalized_text)
+
+        for tag_content in tag_matches:
+            cleaned = self._strip_markdown_fences(tag_content)
+            for candidate in self._extract_json_candidates(cleaned):
+                if isinstance(candidate, dict):
+                    tool_call = self._normalize_text_tool_call(
+                        candidate, available_tool_names
                     )
-                    if dedupe_key in seen_tool_calls:
-                        continue
-                    seen_tool_calls.add(dedupe_key)
-                    extracted.append(tool_call)
+                    if tool_call:
+                        dedupe_key = (
+                            tool_call.name,
+                            _safe_json_dumps(tool_call.arguments),
+                        )
+                        if dedupe_key in seen_tool_calls:
+                            continue
+                        seen_tool_calls.add(dedupe_key)
+                        extracted.append(tool_call)
+
+        # Strategy 2: If no <tool_call> tags found, try extracting JSON candidates
+        # directly from the text (handles missing tags or markdown-wrapped output)
+        if not extracted:
+            for candidate in self._extract_json_candidates(normalized_text):
+                raw_tool_calls: List[Any] = []
+                if isinstance(candidate, dict):
+                    if isinstance(candidate.get("tool_calls"), list):
+                        raw_tool_calls.extend(candidate["tool_calls"])
+                    elif isinstance(candidate.get("tool_call"), dict):
+                        raw_tool_calls.append(candidate["tool_call"])
+                    else:
+                        raw_tool_calls.append(candidate)
+                elif isinstance(candidate, list):
+                    raw_tool_calls.extend(candidate)
+
+                for raw_tool_call in raw_tool_calls:
+                    tool_call = self._normalize_text_tool_call(
+                        raw_tool_call,
+                        available_tool_names,
+                    )
+                    if tool_call:
+                        dedupe_key = (
+                            tool_call.name,
+                            _safe_json_dumps(tool_call.arguments),
+                        )
+                        if dedupe_key in seen_tool_calls:
+                            continue
+                        seen_tool_calls.add(dedupe_key)
+                        extracted.append(tool_call)
 
         if extracted:
             logger.debug(
@@ -1608,7 +1650,7 @@ class QwenLLMProvider:
                 base_url=base_url,
                 api_key=key,
                 payload=payload,
-                timeout=kwargs.get("timeout", 60),
+                timeout=kwargs.get("timeout", 120),
             ):
                 if not isinstance(chunk_data, dict):
                     continue

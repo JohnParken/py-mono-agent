@@ -65,8 +65,9 @@ def build_qwen_tool_prompt(
 
     if options.mode == "text":
         sections.append(
-            "If a tool is needed, output only one "
-            "<tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call> block."
+            "If a tool is needed, output one or more "
+            "<tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call> blocks. "
+            "When multiple tools are needed, place each in its own <tool_call> block on a separate line."
         )
 
     return _join_sections(sections)
