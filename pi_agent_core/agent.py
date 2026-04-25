@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import inspect
+import json
 import time
 from dataclasses import dataclass, field
 from typing import (
@@ -66,6 +67,13 @@ class AgentOptions:
         session_id: 会话 ID
         get_api_key: 动态 API Key 获取
         thinking_budgets: 思考预算
+        strict_tool_arguments: 严格工具参数模式（解析失败时返回结构化错误，不执行工具）
+        static_memory: 固定不变上下文（可通过 provider variable 注入）
+        enable_context_memory: 是否启用默认上下文治理
+        context_recent_messages: 保留最近原始消息数量
+        context_tool_results_to_keep: 额外保留的最近 toolResult 数量
+        context_max_tokens: transform_context 输出的近似 token 预算
+        context_summary_max_chars: 结构化摘要最大字符数
         # Credit tracking 配置
         enable_credit_tracking: 是否启用 credit 计费追踪
         user_id: 用户 ID（用于计费）
@@ -89,6 +97,13 @@ class AgentOptions:
         Callable[[str], Union[Optional[str], Awaitable[Optional[str]]]]
     ] = None
     thinking_budgets: Optional[Dict[str, int]] = None
+    strict_tool_arguments: bool = False
+    static_memory: str = ""
+    enable_context_memory: bool = True
+    context_recent_messages: int = 12
+    context_tool_results_to_keep: int = 6
+    context_max_tokens: int = 12000
+    context_summary_max_chars: int = 6000
     max_retry_delay_ms: Optional[int] = None
     # Credit tracking
     enable_credit_tracking: bool = False
@@ -146,13 +161,24 @@ class Agent:
 
         # 配置
         self._convert_to_llm = opts.convert_to_llm or _default_convert_to_llm
-        self._transform_context = opts.transform_context
+        self._context_memory_enabled = opts.enable_context_memory
+        self._context_recent_messages = max(1, int(opts.context_recent_messages))
+        self._context_tool_results_to_keep = max(0, int(opts.context_tool_results_to_keep))
+        self._context_max_tokens = max(512, int(opts.context_max_tokens))
+        self._context_summary_max_chars = max(512, int(opts.context_summary_max_chars))
+        self._static_memory = (opts.static_memory or "").strip()
+        self._transform_context = (
+            opts.transform_context
+            if opts.transform_context is not None
+            else (self._default_transform_context if self._context_memory_enabled else None)
+        )
         self._steering_mode = opts.steering_mode
         self._follow_up_mode = opts.follow_up_mode
         self._stream_fn: StreamFn = opts.stream_fn or stream_simple
         self._session_id = opts.session_id
         self._get_api_key = opts.get_api_key
         self._thinking_budgets = opts.thinking_budgets
+        self._strict_tool_arguments = opts.strict_tool_arguments
         self._max_retry_delay_ms = opts.max_retry_delay_ms
         # Credit tracking
         self._enable_credit_tracking = opts.enable_credit_tracking
@@ -176,6 +202,154 @@ class Agent:
         # 运行状态
         self._running_prompt: Optional[asyncio.Future] = None
         self._resolve_running_prompt: Optional[Callable] = None
+
+    def _extract_message_text(self, message: AgentMessage) -> str:
+        content = getattr(message, "content", None) or []
+        parts: List[str] = []
+        for item in content:
+            item_type = getattr(item, "type", None)
+            if item_type == "text":
+                text = getattr(item, "text", "")
+                if text:
+                    parts.append(str(text))
+            elif item_type == "toolCall":
+                tool_name = getattr(item, "name", "")
+                args = getattr(item, "arguments", {})
+                args_text = ""
+                try:
+                    args_text = json.dumps(args, ensure_ascii=False)
+                except Exception:
+                    args_text = str(args)
+                parts.append(f"[tool_call] {tool_name} {args_text}")
+        return "\n".join(part for part in parts if part).strip()
+
+    def _estimate_message_tokens(self, message: AgentMessage) -> int:
+        role = str(getattr(message, "role", "") or "")
+        text = self._extract_message_text(message)
+        return max(8, (len(role) // 4) + (len(text) // 4) + 8)
+
+    def _estimate_messages_tokens(self, messages: List[AgentMessage]) -> int:
+        return sum(self._estimate_message_tokens(message) for message in messages)
+
+    def _truncate_text_by_tokens(self, text: str, token_budget: int) -> str:
+        if token_budget <= 0:
+            return ""
+        max_chars = max(64, token_budget * 4)
+        if len(text) <= max_chars:
+            return text
+        clipped = text[:max_chars].rstrip()
+        return clipped + "\n...[summary truncated by context budget]"
+
+    def _build_structured_memory_summary(
+        self,
+        older_messages: List[AgentMessage],
+        latest_tool_results: List[AgentMessage],
+    ) -> str:
+        if not older_messages:
+            return ""
+
+        user_notes: List[str] = []
+        assistant_notes: List[str] = []
+        tool_notes: List[str] = []
+
+        for message in older_messages[-40:]:
+            role = getattr(message, "role", "")
+            text = self._extract_message_text(message)
+            if not text:
+                continue
+            compact = " ".join(text.split())[:300]
+            if role == "user":
+                user_notes.append(compact)
+            elif role == "assistant":
+                assistant_notes.append(compact)
+            elif role == "toolResult":
+                prefix = "error" if getattr(message, "is_error", False) else "ok"
+                tool_name = getattr(message, "tool_name", "")
+                tool_notes.append(f"[{prefix}] {tool_name}: {compact}")
+
+        recent_tool_lines: List[str] = []
+        for message in latest_tool_results[-self._context_tool_results_to_keep :]:
+            text = self._extract_message_text(message)
+            if not text:
+                continue
+            prefix = "error" if getattr(message, "is_error", False) else "ok"
+            tool_name = getattr(message, "tool_name", "")
+            recent_tool_lines.append(f"[{prefix}] {tool_name}: {' '.join(text.split())[:240]}")
+
+        sections: List[str] = [
+            "[MEMORY SUMMARY]",
+            "Use this as compressed history. Prioritize these facts over re-asking old questions.",
+        ]
+        if user_notes:
+            sections.append("User Facts:\n- " + "\n- ".join(user_notes[-8:]))
+        if assistant_notes:
+            sections.append("Assistant Progress:\n- " + "\n- ".join(assistant_notes[-8:]))
+        if tool_notes:
+            sections.append("Historical Tool Findings:\n- " + "\n- ".join(tool_notes[-8:]))
+        if recent_tool_lines:
+            sections.append("Latest Tool Findings:\n- " + "\n- ".join(recent_tool_lines[-6:]))
+
+        summary = "\n\n".join(sections).strip()
+        if len(summary) > self._context_summary_max_chars:
+            summary = summary[: self._context_summary_max_chars].rstrip() + "\n...[memory summary truncated]"
+        return summary
+
+    async def _default_transform_context(
+        self,
+        messages: List[AgentMessage],
+        cancel_event: Optional[Any],
+    ) -> List[AgentMessage]:
+        _ = cancel_event
+        if not messages:
+            return messages
+
+        if self._estimate_messages_tokens(messages) <= self._context_max_tokens:
+            return messages
+
+        split_index = max(0, len(messages) - self._context_recent_messages)
+        older_messages = list(messages[:split_index])
+        recent_messages = list(messages[split_index:])
+
+        latest_tool_results: List[AgentMessage] = []
+        if self._context_tool_results_to_keep > 0:
+            for message in reversed(messages):
+                if getattr(message, "role", None) == "toolResult":
+                    latest_tool_results.append(message)
+                    if len(latest_tool_results) >= self._context_tool_results_to_keep:
+                        break
+            latest_tool_results.reverse()
+
+        retained_messages: List[AgentMessage] = []
+        seen_ids: set[int] = set()
+        for message in latest_tool_results + recent_messages:
+            message_id = id(message)
+            if message_id in seen_ids:
+                continue
+            seen_ids.add(message_id)
+            retained_messages.append(message)
+
+        summary_text = self._build_structured_memory_summary(older_messages, latest_tool_results)
+        if summary_text:
+            summary_message = UserMessage(content=[TextContent(text=summary_text)])
+            transformed: List[AgentMessage] = [summary_message] + retained_messages
+        else:
+            transformed = retained_messages
+
+        while len(transformed) > 1 and self._estimate_messages_tokens(transformed) > self._context_max_tokens:
+            removal_index = 1 if summary_text else 0
+            if removal_index >= len(transformed):
+                break
+            transformed.pop(removal_index)
+
+        if summary_text and transformed:
+            current_tokens = self._estimate_messages_tokens(transformed)
+            if current_tokens > self._context_max_tokens:
+                overflow = current_tokens - self._context_max_tokens
+                summary_token_budget = max(128, self._estimate_message_tokens(transformed[0]) - overflow)
+                clipped_summary = self._truncate_text_by_tokens(summary_text, summary_token_budget)
+                transformed[0] = UserMessage(content=[TextContent(text=clipped_summary)])
+
+        return transformed
 
     # =========================================================================
     # 属性
@@ -509,6 +683,8 @@ class Agent:
             reasoning=reasoning,
             session_id=self._session_id,
             max_retry_delay_ms=self._max_retry_delay_ms,
+            strict_tool_arguments=self._strict_tool_arguments,
+            static_memory=self._static_memory,
             convert_to_llm=self._convert_to_llm,
             transform_context=self._transform_context,
             get_api_key=self._get_api_key,

@@ -625,6 +625,12 @@ response = await stream_simple(
         "tools": tools,
     },
     tool_calling_mode="text",  # "auto" | "native" | "text"
+    static_memory=(
+        "Project Facts:\\n"
+        "- Repository root is /workspace\\n"
+        "- Coding style: snake_case\\n"
+        "- Never rename public APIs without migration notes"
+    ),  # 固定不变上下文，一次定义，多轮复用
 )
 ```
 
@@ -650,11 +656,14 @@ agent = Agent(
             "tools": tools,
         },
         stream_fn=qwen_stream,
+        strict_tool_arguments=True,  # 参数解析失败时返回结构化 tool error，触发模型自我修正
     )
 )
 ```
 
 当前 `llm.yaml` 不支持直接声明 `tool_calling_mode`，需要在运行时通过 `stream_simple(..., tool_calling_mode=...)` 或自定义 `stream_fn` 传入。
+`strict_tool_arguments` 仅在 `Agent`/`agent_loop` 工具执行阶段生效，用于防止解析失败后以 `{}` 继续执行工具。
+`static_memory` 会透传给 Qwen Provider 并注入到 `variable.static_memory`（若模板未包含，会自动把 `(static_memory)` 插入 `appInfo.prompt`）。
 
 ### 5. 使用配置文件
 
@@ -750,6 +759,18 @@ agent = Agent(
     model=get_model("openai", "gpt-4o"),
     transform_context=transform_context
 )
+```
+
+默认情况下 `Agent` 已启用一套轻量上下文治理（结构化摘要 + 最近窗口 + 近似 token 预算裁剪）。可通过以下参数调整：
+
+```python
+agent = Agent(AgentOptions(
+    enable_context_memory=True,
+    context_recent_messages=12,
+    context_tool_results_to_keep=6,
+    context_max_tokens=12000,
+    context_summary_max_chars=6000,
+))
 ```
 
 ## 与原版的区别

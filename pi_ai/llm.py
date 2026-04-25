@@ -15,6 +15,7 @@ LLM 抽象层
 from __future__ import annotations
 
 import asyncio
+import ast
 import importlib.resources
 import json
 import logging
@@ -676,7 +677,7 @@ class OpenAIProvider:
                         }
 
                     if finish_reason == "tool_calls":
-                        logger.info(
+                        logger.debug(
                             "[OPENAI-TOOLS] finish_reason=tool_calls tool_calls=%s",
                             _summarize_tool_calls_for_log(
                                 [c for c in partial.content if isinstance(c, ToolCall)]
@@ -765,6 +766,7 @@ class QwenLLMProvider:
         app_api_key = kwargs.pop("app_api_key", None) or os.environ.get(
             "QWEN_APP_API_KEY", ""
         )
+        static_memory = str(kwargs.pop("static_memory", "") or "").strip()
         app_info_override = kwargs.pop("app_info", None) or {}
         payload_override = kwargs.pop("payload_override", None) or {}
         requested_tool_calling_mode = kwargs.pop("tool_calling_mode", "text")
@@ -785,6 +787,14 @@ class QwenLLMProvider:
                 payload.get("appInfo", {}),
                 app_info_override,
             )
+        if static_memory:
+            app_info = payload.setdefault("appInfo", {})
+            prompt_template = app_info.get("prompt")
+            if isinstance(prompt_template, str):
+                if "(static_memory)" not in prompt_template:
+                    app_info["prompt"] = f"(static_memory)\n{prompt_template}".strip()
+            else:
+                app_info["prompt"] = "(static_memory)"
 
         api_tools = self._build_tools(tools) if tools else []
         prompt_variable_value = (
@@ -799,7 +809,8 @@ class QwenLLMProvider:
         )
         payload["variable"] = self._build_variables(
             prompt_variable_value,
-            payload.get("variable"),
+            static_memory_content=static_memory,
+            variables_override=payload.get("variable"),
         )
 
         data = payload.setdefault("data", {})
@@ -1110,27 +1121,93 @@ class QwenLLMProvider:
             return "", incoming_text
         return incoming_text, f"{existing_full}{incoming_text}"
 
-    def _parse_tool_call_arguments(self, raw_arguments: Any) -> Tuple[Dict[str, Any], str]:
+    def _extract_arguments_dict_from_payload(self, payload: Any) -> Optional[Dict[str, Any]]:
+        if isinstance(payload, dict):
+            if isinstance(payload.get("arguments"), dict):
+                return payload["arguments"]
+            function_data = payload.get("function")
+            if isinstance(function_data, dict) and isinstance(function_data.get("arguments"), dict):
+                return function_data["arguments"]
+            return payload
+        if isinstance(payload, list) and len(payload) == 1 and isinstance(payload[0], dict):
+            return self._extract_arguments_dict_from_payload(payload[0])
+        return None
+
+    def _parse_tool_call_arguments_with_diagnostics(
+        self,
+        raw_arguments: Any,
+        *,
+        source: str = "",
+    ) -> Tuple[Dict[str, Any], str, Optional[str]]:
+        source_label = source or "unknown"
         if raw_arguments is None:
-            return {}, "{}"
+            return {}, "{}", None
         if isinstance(raw_arguments, dict):
-            return raw_arguments, json.dumps(raw_arguments, ensure_ascii=False)
+            return raw_arguments, json.dumps(raw_arguments, ensure_ascii=False), None
         if isinstance(raw_arguments, str):
             raw_arguments = self._normalize_tool_call_text(raw_arguments)
+            if not raw_arguments:
+                return {}, "{}", None
             try:
                 parsed = json.loads(raw_arguments)
-                if isinstance(parsed, dict):
-                    return parsed, raw_arguments
+                arguments_dict = self._extract_arguments_dict_from_payload(parsed)
+                if arguments_dict is not None:
+                    return arguments_dict, json.dumps(arguments_dict, ensure_ascii=False), None
             except json.JSONDecodeError:
-                return {}, raw_arguments
-            return {}, raw_arguments
+                pass
+
+            for candidate in self._extract_json_candidates(raw_arguments):
+                arguments_dict = self._extract_arguments_dict_from_payload(candidate)
+                if arguments_dict is not None:
+                    return arguments_dict, json.dumps(arguments_dict, ensure_ascii=False), None
+
+            try:
+                parsed = ast.literal_eval(raw_arguments)
+                arguments_dict = self._extract_arguments_dict_from_payload(parsed)
+                if arguments_dict is not None:
+                    return arguments_dict, json.dumps(arguments_dict, ensure_ascii=False), None
+            except (ValueError, SyntaxError):
+                pass
+
+            parse_error = (
+                f"Failed to parse tool arguments for source={source_label}. "
+                "Expected a valid JSON object."
+            )
+            logger.warning(
+                "[QWEN-TOOLS] failed to parse tool arguments source=%s raw=%s",
+                source_label,
+                _truncate_log_text(raw_arguments),
+            )
+            return {}, raw_arguments, parse_error
         try:
             text = json.dumps(raw_arguments, ensure_ascii=False)
         except TypeError:
             text = str(raw_arguments)
         if isinstance(raw_arguments, dict):
-            return raw_arguments, text
-        return {}, text
+            return raw_arguments, text, None
+        parse_error = (
+            f"Unsupported tool arguments type for source={source_label}: "
+            f"{type(raw_arguments).__name__}"
+        )
+        logger.warning(
+            "[QWEN-TOOLS] unsupported tool arguments type source=%s type=%s raw=%s",
+            source_label,
+            type(raw_arguments).__name__,
+            _truncate_log_text(text),
+        )
+        return {}, text, parse_error
+
+    def _parse_tool_call_arguments(
+        self,
+        raw_arguments: Any,
+        *,
+        source: str = "",
+    ) -> Tuple[Dict[str, Any], str]:
+        parsed_arguments, raw_text, _ = self._parse_tool_call_arguments_with_diagnostics(
+            raw_arguments,
+            source=source,
+        )
+        return parsed_arguments, raw_text
 
     def _normalize_tool_call_text(self, text: str) -> str:
         return (
@@ -1184,11 +1261,15 @@ class QwenLLMProvider:
             if "arguments" in function_data
             else raw_tool_call.get("arguments", raw_tool_call.get("args", {}))
         )
-        parsed_arguments, _ = self._parse_tool_call_arguments(raw_arguments)
+        parsed_arguments, _, parse_error = self._parse_tool_call_arguments_with_diagnostics(
+            raw_arguments,
+            source=f"text:{name}",
+        )
         return ToolCall(
             id=str(raw_tool_call.get("id") or f"call_{uuid.uuid4().hex}"),
             name=str(name),
             arguments=parsed_arguments,
+            parse_error=parse_error,
         )
 
     def _extract_text_tool_calls(
@@ -1230,9 +1311,15 @@ class QwenLLMProvider:
                     extracted.append(tool_call)
 
         if extracted:
-            logger.info(
+            logger.debug(
                 "[QWEN-TOOLS] parsed text tool_calls=%s",
                 _summarize_tool_calls_for_log(extracted),
+            )
+        elif "<tool_call>" in text or "tool_call" in text:
+            logger.warning(
+                "[QWEN-TOOLS] text contains tool_call marker but no valid tool_calls parsed available_tools=%s text_preview=%s",
+                sorted(available_tool_names),
+                _truncate_log_text(self._normalize_tool_call_text(text)),
             )
         return extracted
 
@@ -1261,20 +1348,30 @@ class QwenLLMProvider:
     def _build_variables(
         self,
         tools_prompt_content: str,
+        static_memory_content: str = "",
         variables_override: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
-        variables = [{"name": "tools", "value": tools_prompt_content or ""}]
+        variables: List[Dict[str, Any]] = []
+        if static_memory_content:
+            variables.append({"name": "static_memory", "value": static_memory_content})
+        variables.append({"name": "tools", "value": tools_prompt_content or ""})
         if not variables_override:
             return variables
 
         copied = self._deep_copy_json_value(variables_override)
-        has_system_var = False
+        has_tools_var = False
+        has_static_memory_var = False
         for item in copied:
             if item.get("name") == "tools":
                 item["value"] = tools_prompt_content or ""
-                has_system_var = True
-        if not has_system_var:
+                has_tools_var = True
+            if item.get("name") == "static_memory":
+                item["value"] = static_memory_content
+                has_static_memory_var = True
+        if not has_tools_var:
             copied.append({"name": "tools", "value": tools_prompt_content or ""})
+        if static_memory_content and not has_static_memory_var:
+            copied.insert(0, {"name": "static_memory", "value": static_memory_content})
         return copied
 
     def _build_sys_prompt_content(
@@ -1415,6 +1512,7 @@ class QwenLLMProvider:
     ) -> AsyncGenerator[AssistantMessageEvent, None]:
         resolved_mode = self._resolve_tool_calling_mode(model, tools, kwargs)
         request_kwargs = dict(kwargs)
+        request_kwargs.pop("tool_calling_mode", None)
         if resolved_mode == "native":
             native_events, native_error = await self._collect_attempt_events(
                 model=model,
@@ -1571,7 +1669,7 @@ class QwenLLMProvider:
                             partial.usage,
                         )
                         if chunk_context:
-                            logger.info("[QWEN-STREAM] completed: %s", chunk_context)
+                            logger.debug("[QWEN-STREAM] completed: %s", chunk_context)
                         yield StreamTextEndEvent(
                             content_index=text_index or 0,
                             content=final_text,
@@ -1585,7 +1683,7 @@ class QwenLLMProvider:
                                 yield tool_event
                         partial.stop_reason = "toolUse" if text_tool_calls else "stop"
                         if text_tool_calls:
-                            logger.info(
+                            logger.debug(
                                 "[QWEN-TOOLS] completed-via-status tool_calls=%s",
                                 _summarize_tool_calls_for_log(text_tool_calls),
                             )
@@ -1759,13 +1857,15 @@ class QwenLLMProvider:
                             pending,
                         )
                         continue
-                    parsed_arguments, raw_arguments_text = self._parse_tool_call_arguments(
-                        pending.get("arguments", "")
+                    parsed_arguments, raw_arguments_text, parse_error = self._parse_tool_call_arguments_with_diagnostics(
+                        pending.get("arguments", ""),
+                        source=f"native:{tool_name}",
                     )
                     tool_call_obj = ToolCall(
                         id=pending.get("id", "") or f"call_{uuid.uuid4().hex}",
                         name=tool_name,
                         arguments=parsed_arguments,
+                        parse_error=parse_error,
                     )
                     dedupe_key = (
                         tool_call_obj.id,
@@ -1794,7 +1894,7 @@ class QwenLLMProvider:
                     )
 
                 if finish_reason == "tool_calls" or text_tool_calls or streamed_tool_calls:
-                    logger.info(
+                    logger.debug(
                         "[QWEN-TOOLS] stop=toolUse finish_reason=%s tool_calls=%s",
                         finish_reason,
                         _summarize_tool_calls_for_log(
@@ -1881,17 +1981,17 @@ class QwenLLMProvider:
                     "Authorization": f"Bearer {self._mask_secret(api_key)}",
                     "Content-Type": "application/json",
                 }
-                logger.info(
+                logger.debug(
                     "[QWEN-REQUEST] base_url=%s timeout=%s payload=%s",
                     base_url,
                     timeout,
                     self._summarize_payload(payload),
                 )
-                logger.info(
+                logger.debug(
                     "[QWEN-REQUEST] headers:\n%s",
                     self._format_json_for_logging(request_headers),
                 )
-                logger.info(
+                logger.debug(
                     "[QWEN-REQUEST] payload(full, masked):\n%s",
                     self._format_json_for_logging(
                         self._sanitize_payload_for_logging(payload)

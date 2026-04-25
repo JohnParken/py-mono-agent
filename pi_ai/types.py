@@ -46,6 +46,7 @@ class ToolCall:
     id: str
     name: str
     arguments: Dict[str, Any]
+    parse_error: Optional[str] = None
     type: Literal["toolCall"] = "toolCall"
 
 

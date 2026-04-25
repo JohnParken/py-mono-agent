@@ -128,6 +128,39 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("# Examples", tools_prompt)
         self.assertNotIn("tools", payload["data"])
 
+    def test_construct_request_text_mode_injects_static_memory_variable(self):
+        payload = self.provider.construct_request(
+            model=self.model,
+            messages=[],
+            system_prompt="You are a tool-using assistant.",
+            tools=[DummyTool()],
+            api_key="dash-token",
+            tool_calling_mode="text",
+            static_memory="Project Facts: keep naming style snake_case.",
+        )
+
+        variable_map = {item["name"]: item["value"] for item in payload["variable"]}
+        self.assertIn("static_memory", variable_map)
+        self.assertEqual(
+            variable_map["static_memory"],
+            "Project Facts: keep naming style snake_case.",
+        )
+        self.assertIn("(static_memory)", payload["appInfo"]["prompt"])
+        self.assertIn("(tools)", payload["appInfo"]["prompt"])
+
+    def test_construct_request_static_memory_prompt_placeholder_not_duplicated(self):
+        payload = self.provider.construct_request(
+            model=self.model,
+            messages=[],
+            system_prompt="You are a tool-using assistant.",
+            tools=[DummyTool()],
+            api_key="dash-token",
+            tool_calling_mode="text",
+            static_memory="Stable context",
+            app_info={"prompt": "(static_memory)\n(tools)"},
+        )
+        self.assertEqual(payload["appInfo"]["prompt"].count("(static_memory)"), 1)
+
     def test_construct_request_native_messages_match_openai_compatible_shape(self):
         assistant_message = AssistantMessage(
             content=[
@@ -176,6 +209,52 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
             messages[0]["tool_calls"][0]["function"]["arguments"],
             '{"text": "hi"}',
         )
+
+    def test_parse_tool_call_arguments_extracts_nested_arguments_object(self):
+        parsed_arguments, raw_text = self.provider._parse_tool_call_arguments(
+            '{"name":"echo","arguments":{"text":"hello"}}',
+            source="test",
+        )
+
+        self.assertEqual(parsed_arguments, {"text": "hello"})
+        self.assertEqual(raw_text, '{"text": "hello"}')
+
+    def test_extract_text_tool_calls_recovers_python_literal_argument_string(self):
+        text = (
+            '<tool_call>{"name":"echo","arguments":"{\'text\': \'hello\'}"}'
+            "</tool_call>"
+        )
+
+        tool_calls = self.provider._extract_text_tool_calls(text, [DummyTool()])
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].name, "echo")
+        self.assertEqual(tool_calls[0].arguments, {"text": "hello"})
+
+    def test_extract_text_tool_calls_recovers_embedded_json_in_argument_string(self):
+        text = (
+            '<tool_call>{"name":"echo","arguments":"call tool with payload '
+            '{\\"text\\":\\"hello\\"} right now"}'
+            "</tool_call>"
+        )
+
+        tool_calls = self.provider._extract_text_tool_calls(text, [DummyTool()])
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].name, "echo")
+        self.assertEqual(tool_calls[0].arguments, {"text": "hello"})
+
+    def test_extract_text_tool_calls_marks_parse_error_for_bad_arguments(self):
+        text = (
+            '<tool_call>{"name":"echo","arguments":"{text: hello}"}'
+            "</tool_call>"
+        )
+
+        tool_calls = self.provider._extract_text_tool_calls(text, [DummyTool()])
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].arguments, {})
+        self.assertIsNotNone(tool_calls[0].parse_error)
 
     async def test_stream_waits_for_finish_reason_and_accepts_dict_arguments(self):
         chunks = [
@@ -718,6 +797,40 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
                 events.append(event)
 
         self.assertEqual([event.type for event in events], ["start", "error"])
+
+    async def test_stream_accepts_explicit_text_tool_calling_mode_without_conflict(self):
+        chunks = [
+            {
+                "output": {
+                    "choices": [
+                        {
+                            "message": {"content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            }
+        ]
+
+        async def fake_stream_request(**kwargs):
+            for chunk in chunks:
+                yield chunk
+
+        self.provider._stream_request = fake_stream_request
+
+        events = []
+        async for event in self.provider.stream(
+            model=self.model,
+            messages=[],
+            system_prompt="You are a tool-using assistant.",
+            tools=[DummyTool()],
+            api_key="dash-token",
+            tool_calling_mode="text",
+        ):
+            events.append(event)
+
+        self.assertEqual(events[-1].type, "done")
+        self.assertEqual(events[-1].reason, "stop")
 
 
 if __name__ == "__main__":

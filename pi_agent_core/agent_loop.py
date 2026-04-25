@@ -415,6 +415,7 @@ async def _run_loop(
                     cancel_event,
                     stream,
                     config.get_steering_messages,
+                    strict_tool_arguments=config.strict_tool_arguments,
                 )
                 tool_results.extend(tool_execution["tool_results"])
                 steering_after_tools = tool_execution.get("steering_messages")
@@ -523,6 +524,8 @@ async def _stream_assistant_response(
         stream_options["reasoning"] = config.reasoning
     if config.session_id:
         stream_options["session_id"] = config.session_id
+    if config.static_memory:
+        stream_options["static_memory"] = config.static_memory
 
     # 模型路由逻辑：根据是否有 tools 选择不同模型
     has_tools = bool(llm_context.get("tools"))
@@ -532,7 +535,12 @@ async def _stream_assistant_response(
     if config.model_router:
         active_model = config.model_router.select_model(has_tools)
         active_config_name = config.model_router.get_model_config_name(has_tools)
-        logger.info(f"模型路由: has_tools={has_tools}, 使用模型={active_model.id}, config_name={active_config_name}")
+        logger.debug(
+            "模型路由: has_tools=%s, 使用模型=%s, config_name=%s",
+            has_tools,
+            active_model.id,
+            active_config_name,
+        )
 
     # Credit tracking: 如果启用，创建包装的流式函数
     if config.enable_credit_tracking and CREDIT_TRACKING_AVAILABLE:
@@ -654,6 +662,7 @@ async def _execute_tool_calls(
     cancel_event: Optional[asyncio.Event],
     stream: EventStream[AgentEvent, List[AgentMessage]],
     get_steering_messages: Optional[Any] = None,
+    strict_tool_arguments: bool = False,
 ) -> Dict[str, Any]:
     """
     执行 assistant 消息中的工具调用。
@@ -672,7 +681,7 @@ async def _execute_tool_calls(
     results: List[ToolResultMessage] = []
     steering_messages: Optional[List[AgentMessage]] = None
 
-    logger.info(
+    logger.debug(
         "[AGENT-TOOLS] executing tool_calls count=%s tool_calls=%s",
         len(tool_calls),
         [_summarize_tool_call_for_log(tool_call) for tool_call in tool_calls],
@@ -690,7 +699,7 @@ async def _execute_tool_calls(
         if tools:
             tool = next((t for t in tools if t.name == tool_call.name), None)
 
-        logger.info(
+        logger.debug(
             "[AGENT-TOOLS] start tool=%s tool_call=%s tool_found=%s",
             tool_call.name,
             _summarize_tool_call_for_log(tool_call),
@@ -712,36 +721,61 @@ async def _execute_tool_calls(
             if tool is None:
                 raise RuntimeError(f"Tool '{tool_call.name}' not found")
 
-            validated_args = validate_tool_arguments(tool, tool_call)
-            logger.debug(
-                "[AGENT-TOOLS] validated tool=%s args_type=%s",
-                tool_call.name,
-                type(validated_args).__name__,
-            )
-
-            def on_update(partial_result: AgentToolResult):
-                logger.debug(
-                    "[AGENT-TOOLS] update tool=%s partial=%s",
+            parse_error = getattr(tool_call, "parse_error", None)
+            if strict_tool_arguments and parse_error:
+                structured_error = {
+                    "error_type": "tool_arguments_parse_error",
+                    "tool_name": tool_call.name,
+                    "tool_call_id": tool_call.id,
+                    "message": (
+                        "Tool arguments could not be parsed. Please emit exactly one "
+                        "correct tool call with valid JSON arguments."
+                    ),
+                    "parse_error": parse_error,
+                    "arguments_preview": _truncate_log_text(str(tool_call.arguments)),
+                }
+                logger.warning(
+                    "[AGENT-TOOLS] strict arguments rejected tool=%s tool_call=%s parse_error=%s",
                     tool_call.name,
-                    _summarize_tool_result_for_log(partial_result),
+                    _summarize_tool_call_for_log(tool_call),
+                    parse_error,
                 )
-                stream.push(
-                    ToolExecutionUpdateEvent(
-                        tool_call_id=tool_call.id,
-                        tool_name=tool_call.name,
-                        args=tool_call.arguments,
-                        partial_result=partial_result,
-                    )
+                result = AgentToolResult(
+                    content=[TextContent(text=json.dumps(structured_error, ensure_ascii=False))],
+                    details=structured_error,
+                )
+                is_error = True
+            else:
+                validated_args = validate_tool_arguments(tool, tool_call)
+                logger.debug(
+                    "[AGENT-TOOLS] validated tool=%s args_type=%s",
+                    tool_call.name,
+                    type(validated_args).__name__,
                 )
 
-            result = await tool.execute(
-                tool_call.id, validated_args, cancel_event, on_update
-            )
-            logger.info(
-                "[AGENT-TOOLS] success tool=%s result=%s",
-                tool_call.name,
-                _summarize_tool_result_for_log(result),
-            )
+                def on_update(partial_result: AgentToolResult):
+                    logger.debug(
+                        "[AGENT-TOOLS] update tool=%s partial=%s",
+                        tool_call.name,
+                        _summarize_tool_result_for_log(partial_result),
+                    )
+                    stream.push(
+                        ToolExecutionUpdateEvent(
+                            tool_call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            args=tool_call.arguments,
+                            partial_result=partial_result,
+                        )
+                    )
+
+                result = await tool.execute(
+                    tool_call.id, validated_args, cancel_event, on_update
+                )
+                logger.debug(
+                    "[AGENT-TOOLS] success tool=%s result=%s",
+                    tool_call.name,
+                    _summarize_tool_result_for_log(result),
+                )
 
         except Exception as e:
             logger.warning(
@@ -810,7 +844,7 @@ def _skip_tool_call(
         details={},
     )
 
-    logger.info(
+    logger.debug(
         "[AGENT-TOOLS] skipped tool=%s tool_call=%s",
         tool_call.name,
         _summarize_tool_call_for_log(tool_call),
