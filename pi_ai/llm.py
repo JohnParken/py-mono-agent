@@ -38,6 +38,7 @@ from typing import (
 import requests
 import pi_logger as _pi_logger
 
+from .prompts.qwen_tools import build_qwen_tool_prompt
 from .types import (
     AssistantMessage,
     Content,
@@ -726,6 +727,7 @@ class QwenLLMProvider:
     DEFAULT_BASE_URL = (
         "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
     )
+    NATIVE_TOOL_MODEL_PREFIXES = ("qwen3.6-35b-a3b",)
     REQUEST_TEMPLATE_RESOURCE = "qwen_request_template.json"
     _request_template_json: Optional[str] = None
 
@@ -765,6 +767,7 @@ class QwenLLMProvider:
         )
         app_info_override = kwargs.pop("app_info", None) or {}
         payload_override = kwargs.pop("payload_override", None) or {}
+        tool_calling_mode = kwargs.pop("tool_calling_mode", "text")
 
         if resolved_api_key:
             payload["token"] = resolved_api_key
@@ -783,6 +786,7 @@ class QwenLLMProvider:
             system_prompt=system_prompt,
             messages=messages,
             api_tools=api_tools,
+            tool_calling_mode=tool_calling_mode,
         )
         payload["variable"] = self._build_variables(
             prompt_variable_value,
@@ -790,7 +794,14 @@ class QwenLLMProvider:
         )
 
         data = payload.setdefault("data", {})
-        data["messages"] = self._build_messages(messages, system_prompt)
+        if tool_calling_mode == "native":
+            data["messages"] = self._build_native_messages(messages)
+        else:
+            data["messages"] = self._build_messages(messages, system_prompt)
+        if tool_calling_mode == "native" and api_tools:
+            data["tools"] = self._deep_copy_json_value(api_tools)
+        else:
+            data.pop("tools", None)
 
         if payload_override:
             payload = self._deep_merge(payload, payload_override)
@@ -944,6 +955,62 @@ class QwenLLMProvider:
                         "role": "tool",
                         "content": self._build_message_content(msg.content),
                         "tool_call_id": msg.tool_call_id,
+                    }
+                )
+
+        return api_messages
+
+    def _build_native_messages(
+        self,
+        messages: List[Any],
+    ) -> List[Dict[str, Any]]:
+        api_messages: List[Dict[str, Any]] = []
+
+        for msg in messages:
+            if msg.role == "user":
+                text_parts = [
+                    c.text
+                    for c in msg.content
+                    if getattr(c, "type", None) == "text"
+                ]
+                api_messages.append({"role": "user", "content": "".join(text_parts)})
+
+            elif msg.role == "assistant":
+                content_text = ""
+                tool_calls_list = []
+                for c in msg.content:
+                    if getattr(c, "type", None) == "text":
+                        content_text += c.text
+                    elif getattr(c, "type", None) == "toolCall":
+                        tool_calls_list.append(
+                            {
+                                "id": getattr(c, "id", ""),
+                                "type": "function",
+                                "function": {
+                                    "name": getattr(c, "name", ""),
+                                    "arguments": json.dumps(
+                                        getattr(c, "arguments", {}),
+                                        ensure_ascii=False,
+                                    ),
+                                },
+                            }
+                        )
+
+                assistant_msg: Dict[str, Any] = {"role": "assistant"}
+                if content_text:
+                    assistant_msg["content"] = content_text
+                if tool_calls_list:
+                    assistant_msg["tool_calls"] = tool_calls_list
+                api_messages.append(assistant_msg)
+
+            elif msg.role == "toolResult":
+                api_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": msg.tool_call_id,
+                        "content": "\n".join(
+                            c.text for c in msg.content if getattr(c, "type", None) == "text"
+                        ),
                     }
                 )
 
@@ -1167,62 +1234,82 @@ class QwenLLMProvider:
         system_prompt: str,
         messages: List[Any],
         api_tools: List[Dict[str, Any]],
+        tool_calling_mode: str = "text",
     ) -> str:
-        sections: List[str] = []
+        _ = messages
+        include_fewshots = tool_calling_mode != "native"
+        return build_qwen_tool_prompt(
+            system_prompt,
+            api_tools,
+            mode=tool_calling_mode,
+            include_fewshots=include_fewshots,
+        )
 
-        if system_prompt:
-            sections.append(system_prompt)
+    def _model_supports_native_tool_calling(self, model: Model) -> bool:
+        model_id = (model.id or "").lower()
+        return any(
+            model_id.startswith(prefix.lower())
+            for prefix in self.NATIVE_TOOL_MODEL_PREFIXES
+        )
 
-        if api_tools:
-            sections.append(
-                "Tools description:\n"
-                + json.dumps(api_tools, ensure_ascii=False, indent=2)
-                + "\n\n"
-                "When a tool is needed, respond only with one or more tool call "
-                "JSON objects inside <tool_call></tool_call> tags. "
-                "Each JSON object must use this shape: "
-                '{"name":"<tool-name>","arguments":{...}}. '
-                "Do not invent tool names or arguments that are not described above."
-            )
+    def _resolve_tool_calling_mode(
+        self,
+        model: Model,
+        tools: Optional[List[ToolDef]],
+        kwargs: Dict[str, Any],
+    ) -> str:
+        requested_mode = str(kwargs.get("tool_calling_mode", "auto") or "auto").lower()
+        if requested_mode not in {"auto", "native", "text"}:
+            requested_mode = "auto"
+        if not tools:
+            return "text"
+        if requested_mode == "native":
+            return "native"
+        if requested_mode == "text":
+            return "text"
+        return "native" if self._model_supports_native_tool_calling(model) else "text"
 
-        tool_interactions: List[Dict[str, Any]] = []
-        for message in messages:
-            if getattr(message, "role", None) == "assistant":
-                for content in getattr(message, "content", []) or []:
-                    if getattr(content, "type", None) == "toolCall":
-                        tool_interactions.append(
-                            {
-                                "kind": "toolCall",
-                                "id": content.id,
-                                "name": content.name,
-                                "arguments": content.arguments,
-                            }
-                        )
-            elif getattr(message, "role", None) == "toolResult":
-                tool_interactions.append(
-                    {
-                        "kind": "toolResult",
-                        "tool_call_id": getattr(message, "tool_call_id", ""),
-                        "tool_name": getattr(message, "tool_name", ""),
-                        "is_error": getattr(message, "is_error", False),
-                        "content": [
-                            {
-                                "type": getattr(content, "type", None),
-                                "text": getattr(content, "text", ""),
-                            }
-                            for content in (getattr(message, "content", []) or [])
-                            if getattr(content, "type", None) == "text"
-                        ],
-                    }
-                )
+    async def _collect_attempt_events(
+        self,
+        model: Model,
+        messages: List[Any],
+        system_prompt: str,
+        tools: Optional[List[ToolDef]],
+        api_key: Optional[str],
+        tool_calling_mode: str,
+        **kwargs,
+    ) -> Tuple[List[AssistantMessageEvent], Optional[Exception]]:
+        events: List[AssistantMessageEvent] = []
+        try:
+            async for event in self._stream_once(
+                model=model,
+                messages=messages,
+                system_prompt=system_prompt,
+                tools=tools,
+                api_key=api_key,
+                tool_calling_mode=tool_calling_mode,
+                **kwargs,
+            ):
+                events.append(event)
+        except Exception as exc:
+            return events, exc
+        return events, None
 
-        if tool_interactions:
-            sections.append(
-                "Tool interactions:\n"
-                + json.dumps(tool_interactions, ensure_ascii=False, indent=2)
-            )
-
-        return "\n\n".join(section for section in sections if section)
+    def _native_attempt_requires_text_fallback(
+        self,
+        events: List[AssistantMessageEvent],
+    ) -> bool:
+        if any(getattr(event, "type", None) == "error" for event in events):
+            return True
+        done_event = next(
+            (event for event in reversed(events) if getattr(event, "type", None) == "done"),
+            None,
+        )
+        if done_event is None:
+            return False
+        message = done_event.message
+        tool_calls = [content for content in message.content if isinstance(content, ToolCall)]
+        return done_event.reason == "toolUse" and len(tool_calls) == 0
 
     def _build_tools(self, tools: List[ToolDef]) -> List[Dict[str, Any]]:
         api_tools = []
@@ -1278,6 +1365,53 @@ class QwenLLMProvider:
         api_key: Optional[str] = None,
         **kwargs,
     ) -> AsyncGenerator[AssistantMessageEvent, None]:
+        resolved_mode = self._resolve_tool_calling_mode(model, tools, kwargs)
+        request_kwargs = dict(kwargs)
+        if resolved_mode == "native":
+            native_events, native_error = await self._collect_attempt_events(
+                model=model,
+                messages=messages,
+                system_prompt=system_prompt,
+                tools=tools,
+                api_key=api_key,
+                tool_calling_mode="native",
+                **request_kwargs,
+            )
+            if native_error is None and not self._native_attempt_requires_text_fallback(native_events):
+                for event in native_events:
+                    yield event
+                return
+
+            logger.warning(
+                "[QWEN-TOOLS] native tool calling fallback to text mode model=%s reason=%s",
+                model.id,
+                str(native_error) if native_error else "missing_structured_tool_calls",
+            )
+
+        text_events, text_error = await self._collect_attempt_events(
+            model=model,
+            messages=messages,
+            system_prompt=system_prompt,
+            tools=tools,
+            api_key=api_key,
+            tool_calling_mode="text",
+            **request_kwargs,
+        )
+        for event in text_events:
+            yield event
+        if text_error is not None:
+            raise text_error
+
+    async def _stream_once(
+        self,
+        model: Model,
+        messages: List[Any],
+        system_prompt: str,
+        tools: Optional[List[ToolDef]] = None,
+        api_key: Optional[str] = None,
+        tool_calling_mode: str = "text",
+        **kwargs,
+    ) -> AsyncGenerator[AssistantMessageEvent, None]:
         key = api_key or model.api_key or os.environ.get("DASHSCOPE_API_KEY", "")
         base_url = model.base_url or self.DEFAULT_BASE_URL
         payload = self.construct_request(
@@ -1286,15 +1420,17 @@ class QwenLLMProvider:
             system_prompt=system_prompt,
             tools=tools,
             api_key=key,
+            tool_calling_mode=tool_calling_mode,
             **kwargs,
         )
 
         logger.debug(
-            "[QWEN-STREAM] start provider=%s model=%s base_url=%s has_api_key=%s payload=%s",
+            "[QWEN-STREAM] start provider=%s model=%s base_url=%s has_api_key=%s tool_mode=%s payload=%s",
             model.provider,
             model.id,
             base_url,
             bool(key),
+            tool_calling_mode,
             self._summarize_payload(payload),
         )
 

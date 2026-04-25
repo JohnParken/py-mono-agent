@@ -30,7 +30,7 @@ where = ["."]
 include = ["pi_ai*", "pi_agent_core*", "pi_code_agent*"]
 
 [tool.setuptools.package-data]
-pi_ai = ["llm.yaml.example", "qwen_request_template.json"]
+pi_ai = ["llm.yaml.example", "qwen_request_template.json", "prompts/qwen_tools/*.md"]
 
 [tool.uv]
 package = true

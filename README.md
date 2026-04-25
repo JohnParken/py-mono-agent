@@ -602,6 +602,60 @@ agent = Agent(
 )
 ```
 
+### 4.1 Qwen `native/text` 模式开关
+
+`QwenLLMProvider` 的工具调用模式开关是运行时参数 `tool_calling_mode`，不是 YAML 固定字段。
+
+- `tool_calling_mode="auto"`: 默认值。若模型 ID 命中 `qwen3.6-35b-a3b*`，先走 `native`，失败后自动回退 `text`。
+- `tool_calling_mode="native"`: 强制原生 Function Calling（请求体携带 `data.tools`）。
+- `tool_calling_mode="text"`: 强制文本协议（不发送 `data.tools`，使用 `<tools>/<tool_call>` 提示词格式）。
+
+直接调用 `stream_simple` 时：
+
+```python
+from pi_ai import stream_simple, get_model
+
+model = get_model("QwenLLMprovider", "qwen3.6-35b-a3b-instruct")
+
+response = await stream_simple(
+    model,
+    {
+        "system_prompt": "You are a tool-using assistant.",
+        "messages": messages,
+        "tools": tools,
+    },
+    tool_calling_mode="text",  # "auto" | "native" | "text"
+)
+```
+
+使用 `Agent` 时，可通过自定义 `stream_fn` 传入开关：
+
+```python
+from pi_ai import stream_simple, get_model
+from pi_agent_core import Agent, AgentOptions
+
+async def qwen_stream(model, context, **opts):
+    return await stream_simple(
+        model,
+        context,
+        tool_calling_mode="text",  # "auto" | "native" | "text"
+        **opts,
+    )
+
+agent = Agent(
+    AgentOptions(
+        initial_state={
+            "system_prompt": "You are a tool-using assistant.",
+            "model": get_model("QwenLLMprovider", "qwen3.6-35b-a3b-instruct"),
+            "tools": tools,
+        },
+        stream_fn=qwen_stream,
+    )
+)
+```
+
+当前 `llm.yaml` 不支持直接声明 `tool_calling_mode`，需要在运行时通过 `stream_simple(..., tool_calling_mode=...)` 或自定义 `stream_fn` 传入。
+
 ### 5. 使用配置文件
 
 通过 YAML 配置文件管理多个 LLM 配置：

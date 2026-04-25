@@ -3,7 +3,7 @@ import unittest
 from pydantic import BaseModel
 
 from pi_ai.llm import QwenLLMProvider, Model
-from pi_ai.types import AssistantMessage, TextContent, ToolCall
+from pi_ai.types import AssistantMessage, TextContent, ToolCall, ToolResultMessage
 
 
 class EchoArgs(BaseModel):
@@ -43,9 +43,88 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["modelId"], "lightapplication")
         self.assertEqual(payload["appInfo"]["agent_id"], "custom-agent")
         self.assertEqual(payload["appInfo"]["temperature"], 0.1)
-        self.assertIn("Tools description:", payload["variable"][0]["value"])
+        self.assertIn("# Tools", payload["variable"][0]["value"])
+        self.assertIn("<tools>", payload["variable"][0]["value"])
         self.assertIn("<tool_call>", payload["variable"][0]["value"])
         self.assertNotIn("tools", payload["data"])
+
+    def test_construct_request_native_mode_uses_api_tools(self):
+        native_model = Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct")
+
+        payload = self.provider.construct_request(
+            model=native_model,
+            messages=[],
+            system_prompt="You are a tool-using assistant.",
+            tools=[DummyTool()],
+            api_key="dash-token",
+            tool_calling_mode="native",
+        )
+
+        self.assertEqual(payload["data"]["tools"][0]["function"]["name"], "echo")
+        native_prompt = payload["variable"][0]["value"]
+        self.assertIn("You are a tool-using assistant.", native_prompt)
+        self.assertIn("# Shared Tool Use Rules", native_prompt)
+        self.assertIn("# Native Tool Calling Rules", native_prompt)
+        self.assertNotIn("<tool_call>", native_prompt)
+        self.assertNotIn("<tools>", native_prompt)
+
+    def test_construct_request_text_mode_does_not_inject_tool_interactions(self):
+        assistant_message = AssistantMessage(
+            content=[
+                TextContent(text="I will use tool."),
+                ToolCall(id="call_1", name="echo", arguments={"text": "hi"}),
+            ]
+        )
+
+        payload = self.provider.construct_request(
+            model=self.model,
+            messages=[assistant_message],
+            system_prompt="You are a tool-using assistant.",
+            tools=[DummyTool()],
+            api_key="dash-token",
+            tool_calling_mode="text",
+        )
+
+        tools_prompt = payload["variable"][0]["value"]
+        self.assertIn("# Shared Tool Use Rules", tools_prompt)
+        self.assertIn("# Text Fallback Tool Protocol", tools_prompt)
+        self.assertIn("# Tools", tools_prompt)
+        self.assertIn("<tools>", tools_prompt)
+        self.assertIn("<tool_call>", tools_prompt)
+        self.assertIn("# Examples", tools_prompt)
+        self.assertNotIn("tools", payload["data"])
+
+    def test_construct_request_native_messages_match_openai_compatible_shape(self):
+        assistant_message = AssistantMessage(
+            content=[
+                TextContent(text="I will inspect the file."),
+                ToolCall(id="call_1", name="echo", arguments={"text": "hi"}),
+            ]
+        )
+        tool_result = ToolResultMessage(
+            tool_call_id="call_1",
+            tool_name="echo",
+            content=[TextContent(text="ok")],
+        )
+        payload = self.provider.construct_request(
+            model=Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct"),
+            messages=[
+                assistant_message,
+                tool_result,
+            ],
+            system_prompt="You are a tool-using assistant.",
+            tools=[DummyTool()],
+            api_key="dash-token",
+            tool_calling_mode="native",
+        )
+
+        native_messages = payload["data"]["messages"]
+        self.assertEqual(native_messages[0]["role"], "assistant")
+        self.assertIsInstance(native_messages[0].get("content"), str)
+        self.assertIn("tool_calls", native_messages[0])
+        self.assertEqual(native_messages[1]["role"], "tool")
+        self.assertEqual(native_messages[1]["content"], "ok")
+        self.assertEqual(native_messages[1]["tool_call_id"], "call_1")
 
     def test_build_messages_keeps_assistant_tool_calls(self):
         assistant_message = AssistantMessage(
@@ -272,6 +351,113 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0].name, "echo")
         self.assertEqual(tool_calls[0].arguments, {"text": "hello"})
+
+    async def test_stream_native_request_failure_falls_back_to_text_mode(self):
+        native_model = Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct")
+
+        async def fake_stream_request(**kwargs):
+            payload = kwargs["payload"]
+            if payload["data"].get("tools"):
+                raise RuntimeError("native tools unsupported")
+            yield {
+                "output": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '<tool_call>{"name":"echo","arguments":{"text":"fallback"}}'
+                                    "</tool_call>"
+                                ),
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            }
+
+        self.provider._stream_request = fake_stream_request
+
+        events = []
+        async for event in self.provider.stream(
+            model=native_model,
+            messages=[],
+            system_prompt="You are a tool-using assistant.",
+            tools=[DummyTool()],
+            api_key="dash-token",
+        ):
+            events.append(event)
+
+        done_event = events[-1]
+        self.assertEqual(done_event.reason, "toolUse")
+        tool_calls = [
+            content for content in done_event.message.content if isinstance(content, ToolCall)
+        ]
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].name, "echo")
+        self.assertEqual(tool_calls[0].arguments, {"text": "fallback"})
+
+    async def test_stream_native_blank_tool_calls_falls_back_to_text_mode(self):
+        native_model = Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct")
+
+        async def fake_stream_request(**kwargs):
+            payload = kwargs["payload"]
+            if payload["data"].get("tools"):
+                yield {
+                    "output": {
+                        "choices": [
+                            {
+                                "message": {
+                                    "tool_calls": [
+                                        {
+                                            "id": "call_blank",
+                                            "function": {
+                                                "name": "",
+                                                "arguments": {"text": "ignored"},
+                                            },
+                                        }
+                                    ]
+                                },
+                                "finish_reason": "tool_calls",
+                            }
+                        ]
+                    }
+                }
+                return
+            yield {
+                "output": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '<tool_call>{"name":"echo","arguments":{"text":"recovered"}}'
+                                    "</tool_call>"
+                                ),
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            }
+
+        self.provider._stream_request = fake_stream_request
+
+        events = []
+        async for event in self.provider.stream(
+            model=native_model,
+            messages=[],
+            system_prompt="You are a tool-using assistant.",
+            tools=[DummyTool()],
+            api_key="dash-token",
+        ):
+            events.append(event)
+
+        done_event = events[-1]
+        self.assertEqual(done_event.reason, "toolUse")
+        tool_calls = [
+            content for content in done_event.message.content if isinstance(content, ToolCall)
+        ]
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].arguments, {"text": "recovered"})
 
 
 if __name__ == "__main__":
