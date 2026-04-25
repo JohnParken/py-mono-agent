@@ -767,7 +767,12 @@ class QwenLLMProvider:
         )
         app_info_override = kwargs.pop("app_info", None) or {}
         payload_override = kwargs.pop("payload_override", None) or {}
-        tool_calling_mode = kwargs.pop("tool_calling_mode", "text")
+        requested_tool_calling_mode = kwargs.pop("tool_calling_mode", "text")
+        resolved_tool_calling_mode = self._resolve_tool_calling_mode(
+            model,
+            tools,
+            {"tool_calling_mode": requested_tool_calling_mode},
+        )
 
         if resolved_api_key:
             payload["token"] = resolved_api_key
@@ -782,11 +787,15 @@ class QwenLLMProvider:
             )
 
         api_tools = self._build_tools(tools) if tools else []
-        prompt_variable_value = self._build_sys_prompt_content(
-            system_prompt=system_prompt,
-            messages=messages,
-            api_tools=api_tools,
-            tool_calling_mode=tool_calling_mode,
+        prompt_variable_value = (
+            ""
+            if resolved_tool_calling_mode == "native"
+            else self._build_sys_prompt_content(
+                system_prompt=system_prompt,
+                messages=messages,
+                api_tools=api_tools,
+                tool_calling_mode=resolved_tool_calling_mode,
+            )
         )
         payload["variable"] = self._build_variables(
             prompt_variable_value,
@@ -794,11 +803,11 @@ class QwenLLMProvider:
         )
 
         data = payload.setdefault("data", {})
-        if tool_calling_mode == "native":
+        if resolved_tool_calling_mode == "native":
             data["messages"] = self._build_native_messages(messages)
         else:
             data["messages"] = self._build_messages(messages, system_prompt)
-        if tool_calling_mode == "native" and api_tools:
+        if resolved_tool_calling_mode == "native" and api_tools:
             data["tools"] = self._deep_copy_json_value(api_tools)
         else:
             data.pop("tools", None)
@@ -807,8 +816,10 @@ class QwenLLMProvider:
             payload = self._deep_merge(payload, payload_override)
 
         logger.debug(
-            "[QWEN-TOOLS] construct_request model=%s tool_count=%s tools=%s variable_names=%s",
+            "[QWEN-TOOLS] construct_request model=%s requested_mode=%s resolved_mode=%s tool_count=%s tools=%s variable_names=%s",
             model.id,
+            requested_tool_calling_mode,
+            resolved_tool_calling_mode,
             len(api_tools),
             [tool["function"]["name"] for tool in api_tools],
             [item.get("name") for item in payload.get("variable", []) if isinstance(item, dict)],
@@ -1061,6 +1072,43 @@ class QwenLLMProvider:
         if isinstance(content, dict):
             return str(content.get("text") or content.get("value") or "")
         return str(content)
+
+    def _merge_stream_fragment(self, existing: str, incoming: Any) -> str:
+        incoming_text = ""
+        if incoming is not None:
+            incoming_text = str(incoming)
+        if not incoming_text:
+            return existing
+        if not existing:
+            return incoming_text
+        existing_stripped = existing.strip()
+        incoming_stripped = incoming_text.strip()
+        if (
+            existing_stripped.startswith(("{", "["))
+            and existing_stripped.endswith(("}", "]"))
+            and incoming_stripped.startswith(("{", "["))
+            and incoming_stripped.endswith(("}", "]"))
+        ):
+            return incoming_text
+        if incoming_text.startswith(existing):
+            return incoming_text
+        if existing.startswith(incoming_text) or incoming_text in existing:
+            return existing
+        return f"{existing}{incoming_text}"
+
+    def _compute_stream_text_delta(self, existing_full: str, incoming: Any) -> Tuple[str, str]:
+        incoming_text = ""
+        if incoming is not None:
+            incoming_text = str(incoming)
+        if not incoming_text:
+            return "", existing_full
+        if not existing_full:
+            return incoming_text, incoming_text
+        if incoming_text.startswith(existing_full):
+            return incoming_text[len(existing_full) :], incoming_text
+        if existing_full.startswith(incoming_text):
+            return "", incoming_text
+        return incoming_text, f"{existing_full}{incoming_text}"
 
     def _parse_tool_call_arguments(self, raw_arguments: Any) -> Tuple[Dict[str, Any], str]:
         if raw_arguments is None:
@@ -1453,6 +1501,9 @@ class QwenLLMProvider:
         try:
             text_index: Optional[int] = None
             thinking_index: Optional[int] = None
+            streamed_text_full = ""
+            streamed_thinking_full = ""
+            pending_tool_calls: Dict[str, Dict[str, str]] = {}
             completed = False
 
             async for chunk_data in self._stream_request(
@@ -1554,6 +1605,10 @@ class QwenLLMProvider:
                     or message.get("reasoning_text")
                 )
                 if reasoning_text:
+                    thinking_delta, streamed_thinking_full = self._compute_stream_text_delta(
+                        streamed_thinking_full,
+                        reasoning_text,
+                    )
                     if thinking_index is None:
                         partial.content.append(ThinkingContent(thinking=""))
                         thinking_index = len(partial.content) - 1
@@ -1561,74 +1616,75 @@ class QwenLLMProvider:
                             content_index=thinking_index,
                             partial=partial,
                         )
+                    if thinking_delta:
+                        thinking_block = partial.content[thinking_index]
+                        if isinstance(thinking_block, ThinkingContent):
+                            thinking_block.thinking += thinking_delta
+                        yield StreamThinkingDeltaEvent(
+                            content_index=thinking_index,
+                            delta=thinking_delta,
+                            partial=partial,
+                        )
                     thinking_block = partial.content[thinking_index]
-                    if isinstance(thinking_block, ThinkingContent):
-                        thinking_block.thinking += reasoning_text
-                    yield StreamThinkingDeltaEvent(
-                        content_index=thinking_index,
-                        delta=reasoning_text,
-                        partial=partial,
-                    )
                     yield StreamThinkingEndEvent(
                         content_index=thinking_index,
-                        content=thinking_block.thinking if isinstance(thinking_block, ThinkingContent) else reasoning_text,
+                        content=thinking_block.thinking if isinstance(thinking_block, ThinkingContent) else streamed_thinking_full,
                         partial=partial,
                     )
 
                 content_text = self._extract_message_text(message.get("content"))
                 if content_text:
+                    text_delta, streamed_text_full = self._compute_stream_text_delta(
+                        streamed_text_full,
+                        content_text,
+                    )
                     if text_index is None:
                         partial.content.append(TextContent(text=""))
                         text_index = len(partial.content) - 1
                         yield StreamTextStartEvent(content_index=text_index, partial=partial)
-                    text_block = partial.content[text_index]
-                    if isinstance(text_block, TextContent):
-                        text_block.text += content_text
-                    yield StreamTextDeltaEvent(
-                        content_index=text_index,
-                        delta=content_text,
-                        partial=partial,
-                    )
+                    if text_delta:
+                        text_block = partial.content[text_index]
+                        if isinstance(text_block, TextContent):
+                            text_block.text += text_delta
+                        yield StreamTextDeltaEvent(
+                            content_index=text_index,
+                            delta=text_delta,
+                            partial=partial,
+                        )
 
                 tool_calls = message.get("tool_calls") or []
-                for tool_call in tool_calls:
+                for idx, tool_call in enumerate(tool_calls):
                     logger.debug(
                         "[QWEN-TOOLS] chunk tool_call=%s finish_reason=%s",
                         _summarize_tool_call_for_log(tool_call),
                         finish_reason,
                     )
-                    function_data = tool_call.get("function") or {}
-                    tool_name = function_data.get("name") or tool_call.get("name", "")
-                    if not tool_name:
-                        logger.warning(
-                            "[QWEN-TOOLS] skipped blank tool_call raw=%s",
-                            _summarize_tool_call_for_log(tool_call),
-                        )
+                    if not isinstance(tool_call, dict):
                         continue
-                    parsed_arguments, raw_arguments_text = self._parse_tool_call_arguments(
-                        function_data.get("arguments")
+                    function_data = tool_call.get("function") or {}
+                    call_index = tool_call.get("index")
+                    call_id_raw = tool_call.get("id")
+                    fallback_key = str(call_index) if call_index is not None else ""
+                    if not fallback_key:
+                        fallback_key = str(call_id_raw or idx)
+                    pending = pending_tool_calls.setdefault(
+                        fallback_key,
+                        {"id": "", "name": "", "arguments": ""},
                     )
-                    tool_call_obj = ToolCall(
-                        id=tool_call.get("id", ""),
-                        name=tool_name,
-                        arguments=parsed_arguments,
+
+                    pending["id"] = self._merge_stream_fragment(pending["id"], call_id_raw)
+                    pending["name"] = self._merge_stream_fragment(
+                        pending["name"],
+                        function_data.get("name") or tool_call.get("name"),
                     )
-                    partial.content.append(tool_call_obj)
-                    content_index = len(partial.content) - 1
-                    yield StreamToolCallStartEvent(
-                        content_index=content_index,
-                        partial=partial,
-                    )
-                    yield StreamToolCallDeltaEvent(
-                        content_index=content_index,
-                        delta=raw_arguments_text,
-                        partial=partial,
-                    )
-                    yield StreamToolCallEndEvent(
-                        content_index=content_index,
-                        tool_call=tool_call_obj,
-                        partial=partial,
-                    )
+                    raw_arguments = function_data.get("arguments")
+                    if isinstance(raw_arguments, dict):
+                        pending["arguments"] = json.dumps(raw_arguments, ensure_ascii=False)
+                    else:
+                        pending["arguments"] = self._merge_stream_fragment(
+                            pending["arguments"],
+                            raw_arguments,
+                        )
 
                 usage = chunk_data.get("usage") or {}
                 partial.usage = {
@@ -1685,7 +1741,59 @@ class QwenLLMProvider:
                     ):
                         yield tool_event
 
-                if finish_reason == "tool_calls" or text_tool_calls:
+                streamed_tool_calls: List[ToolCall] = []
+                existing_tool_call_keys = {
+                    (
+                        c.id,
+                        c.name,
+                        _safe_json_dumps(c.arguments),
+                    )
+                    for c in partial.content
+                    if isinstance(c, ToolCall)
+                }
+                for pending in pending_tool_calls.values():
+                    tool_name = pending.get("name", "")
+                    if not tool_name:
+                        logger.warning(
+                            "[QWEN-TOOLS] skipped blank tool_call aggregated=%s",
+                            pending,
+                        )
+                        continue
+                    parsed_arguments, raw_arguments_text = self._parse_tool_call_arguments(
+                        pending.get("arguments", "")
+                    )
+                    tool_call_obj = ToolCall(
+                        id=pending.get("id", "") or f"call_{uuid.uuid4().hex}",
+                        name=tool_name,
+                        arguments=parsed_arguments,
+                    )
+                    dedupe_key = (
+                        tool_call_obj.id,
+                        tool_call_obj.name,
+                        _safe_json_dumps(tool_call_obj.arguments),
+                    )
+                    if dedupe_key in existing_tool_call_keys:
+                        continue
+                    existing_tool_call_keys.add(dedupe_key)
+                    streamed_tool_calls.append(tool_call_obj)
+                    partial.content.append(tool_call_obj)
+                    content_index = len(partial.content) - 1
+                    yield StreamToolCallStartEvent(
+                        content_index=content_index,
+                        partial=partial,
+                    )
+                    yield StreamToolCallDeltaEvent(
+                        content_index=content_index,
+                        delta=raw_arguments_text,
+                        partial=partial,
+                    )
+                    yield StreamToolCallEndEvent(
+                        content_index=content_index,
+                        tool_call=tool_call_obj,
+                        partial=partial,
+                    )
+
+                if finish_reason == "tool_calls" or text_tool_calls or streamed_tool_calls:
                     logger.info(
                         "[QWEN-TOOLS] stop=toolUse finish_reason=%s tool_calls=%s",
                         finish_reason,
@@ -1754,6 +1862,7 @@ class QwenLLMProvider:
             partial.error_message = str(exc)
             yield StreamErrorEvent(reason="error", error=partial)
             logger.warning("[QWEN-ERROR] stream error: %s", exc)
+            raise
 
     async def _stream_request(
         self,

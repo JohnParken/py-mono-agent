@@ -62,9 +62,43 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["data"]["tools"][0]["function"]["name"], "echo")
         native_prompt = payload["variable"][0]["value"]
-        self.assertIn("You are a tool-using assistant.", native_prompt)
-        self.assertIn("# Shared Tool Use Rules", native_prompt)
-        self.assertIn("# Native Tool Calling Rules", native_prompt)
+        self.assertEqual(native_prompt, "")
+        self.assertNotIn("<tool_call>", native_prompt)
+        self.assertNotIn("<tools>", native_prompt)
+
+    def test_construct_request_auto_mode_resolves_to_native_for_supported_models(self):
+        native_model = Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct")
+
+        payload = self.provider.construct_request(
+            model=native_model,
+            messages=[],
+            system_prompt="You are a tool-using assistant.",
+            tools=[DummyTool()],
+            api_key="dash-token",
+            tool_calling_mode="auto",
+        )
+
+        self.assertEqual(payload["data"]["tools"][0]["function"]["name"], "echo")
+        auto_prompt = payload["variable"][0]["value"]
+        self.assertEqual(auto_prompt, "")
+        self.assertNotIn("<tool_call>", auto_prompt)
+        self.assertNotIn("<tools>", auto_prompt)
+
+    def test_construct_request_native_mode_is_case_insensitive(self):
+        native_model = Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct")
+
+        payload = self.provider.construct_request(
+            model=native_model,
+            messages=[],
+            system_prompt="You are a tool-using assistant.",
+            tools=[DummyTool()],
+            api_key="dash-token",
+            tool_calling_mode="NATIVE",
+        )
+
+        self.assertEqual(payload["data"]["tools"][0]["function"]["name"], "echo")
+        native_prompt = payload["variable"][0]["value"]
+        self.assertEqual(native_prompt, "")
         self.assertNotIn("<tool_call>", native_prompt)
         self.assertNotIn("<tools>", native_prompt)
 
@@ -207,6 +241,212 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
             content for content in done_event.message.content if isinstance(content, ToolCall)
         ]
         self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].name, "echo")
+        self.assertEqual(tool_calls[0].arguments, {"text": "hello"})
+
+    async def test_stream_native_merges_incremental_tool_call_fragments(self):
+        chunks = [
+            {
+                "output": {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "echo",
+                                            "arguments": None,
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "output": {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": None,
+                                            "arguments": '{"text":"hello"}',
+                                        },
+                                    }
+                                ]
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                }
+            },
+        ]
+
+        async def fake_stream_request(**kwargs):
+            for chunk in chunks:
+                yield chunk
+
+        self.provider._stream_request = fake_stream_request
+
+        events = []
+        async for event in self.provider.stream(
+            model=Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct"),
+            messages=[],
+            system_prompt="You are a tool-using assistant.",
+            tools=[DummyTool()],
+            api_key="dash-token",
+        ):
+            events.append(event)
+
+        done_event = events[-1]
+        self.assertEqual(done_event.reason, "toolUse")
+        tool_calls = [
+            content for content in done_event.message.content if isinstance(content, ToolCall)
+        ]
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].id, "call_1")
+        self.assertEqual(tool_calls[0].name, "echo")
+        self.assertEqual(tool_calls[0].arguments, {"text": "hello"})
+
+    async def test_stream_handles_cumulative_text_chunks_without_duplicate_content(self):
+        chunks = [
+            {
+                "output": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "Hel",
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "output": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "Hello",
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "output": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "Hello!",
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            },
+        ]
+
+        async def fake_stream_request(**kwargs):
+            for chunk in chunks:
+                yield chunk
+
+        self.provider._stream_request = fake_stream_request
+
+        events = []
+        async for event in self.provider.stream(
+            model=self.model,
+            messages=[],
+            system_prompt="You are a tool-using assistant.",
+            tools=[DummyTool()],
+            api_key="dash-token",
+        ):
+            events.append(event)
+
+        done_event = events[-1]
+        self.assertEqual(done_event.reason, "stop")
+        text_blocks = [
+            content for content in done_event.message.content if isinstance(content, TextContent)
+        ]
+        self.assertEqual(len(text_blocks), 1)
+        self.assertEqual(text_blocks[0].text, "Hello!")
+
+    async def test_stream_handles_cumulative_tool_calls_without_duplicates(self):
+        chunks = [
+            {
+                "output": {
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "function": {
+                                            "name": "echo",
+                                            "arguments": '{"text":"hel"}',
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "output": {
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "function": {
+                                            "name": "echo",
+                                            "arguments": '{"text":"hello"}',
+                                        },
+                                    }
+                                ]
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                }
+            },
+        ]
+
+        async def fake_stream_request(**kwargs):
+            for chunk in chunks:
+                yield chunk
+
+        self.provider._stream_request = fake_stream_request
+
+        events = []
+        async for event in self.provider.stream(
+            model=self.model,
+            messages=[],
+            system_prompt="You are a tool-using assistant.",
+            tools=[DummyTool()],
+            api_key="dash-token",
+        ):
+            events.append(event)
+
+        done_event = events[-1]
+        self.assertEqual(done_event.reason, "toolUse")
+        tool_calls = [
+            content for content in done_event.message.content if isinstance(content, ToolCall)
+        ]
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].id, "call_1")
         self.assertEqual(tool_calls[0].name, "echo")
         self.assertEqual(tool_calls[0].arguments, {"text": "hello"})
 
@@ -458,6 +698,26 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0].arguments, {"text": "recovered"})
+
+    async def test_stream_text_mode_re_raises_generic_errors_after_error_event(self):
+        async def fake_stream_request(**kwargs):
+            raise RuntimeError("boom")
+            yield
+
+        self.provider._stream_request = fake_stream_request
+
+        events = []
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            async for event in self.provider.stream(
+                model=self.model,
+                messages=[],
+                system_prompt="You are a tool-using assistant.",
+                tools=None,
+                api_key="dash-token",
+            ):
+                events.append(event)
+
+        self.assertEqual([event.type for event in events], ["start", "error"])
 
 
 if __name__ == "__main__":
