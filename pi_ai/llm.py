@@ -1668,6 +1668,10 @@ class QwenLLMProvider:
                 if self._is_chunk_failed(chunk_data):
                     raise RuntimeError(self._build_chunk_error(chunk_data))
 
+                # status/result wrapper family.
+                # Any status other than "completed" (including "success" and "running")
+                # is treated as an incremental text fragment. Only "completed" finalizes
+                # the stream.
                 if "result" in chunk_data and "status" in chunk_data:
                     if text_index is None:
                         partial.content.append(TextContent(text=""))
@@ -1712,11 +1716,12 @@ class QwenLLMProvider:
                         )
                         if chunk_context:
                             logger.debug("[QWEN-STREAM] completed: %s", chunk_context)
-                        yield StreamTextEndEvent(
-                            content_index=text_index or 0,
-                            content=final_text,
-                            partial=partial,
-                        )
+                        if text_index is not None:
+                            yield StreamTextEndEvent(
+                                content_index=text_index,
+                                content=final_text,
+                                partial=partial,
+                            )
                         for tool_call_obj in text_tool_calls:
                             async for tool_event in self._emit_qwen_tool_call(
                                 partial,
@@ -1765,12 +1770,6 @@ class QwenLLMProvider:
                             delta=thinking_delta,
                             partial=partial,
                         )
-                    thinking_block = partial.content[thinking_index]
-                    yield StreamThinkingEndEvent(
-                        content_index=thinking_index,
-                        content=thinking_block.thinking if isinstance(thinking_block, ThinkingContent) else streamed_thinking_full,
-                        partial=partial,
-                    )
 
                 content_text = self._extract_message_text(message.get("content"))
                 if content_text:
@@ -1850,6 +1849,14 @@ class QwenLLMProvider:
 
                 if not finish_reason:
                     continue
+
+                if thinking_index is not None:
+                    thinking_block = partial.content[thinking_index]
+                    yield StreamThinkingEndEvent(
+                        content_index=thinking_index,
+                        content=thinking_block.thinking if isinstance(thinking_block, ThinkingContent) else streamed_thinking_full,
+                        partial=partial,
+                    )
 
                 existing_tool_calls = [
                     c for c in partial.content if isinstance(c, ToolCall)
@@ -1958,6 +1965,13 @@ class QwenLLMProvider:
                 return
 
             if not completed:
+                if thinking_index is not None:
+                    thinking_block = partial.content[thinking_index]
+                    yield StreamThinkingEndEvent(
+                        content_index=thinking_index,
+                        content=thinking_block.thinking if isinstance(thinking_block, ThinkingContent) else streamed_thinking_full,
+                        partial=partial,
+                    )
                 text_tool_calls: List[ToolCall] = []
                 if text_index is not None:
                     text_block = partial.content[text_index]
