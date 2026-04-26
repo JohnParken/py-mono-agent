@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from pi_ai import get_llm_config, get_model
-from pi_agent_core import Agent, AgentOptions
+from pi_agent_core import Agent
 from pi_agent_core.types import (
     AgentEndEvent,
     MessageEndEvent,
@@ -20,7 +20,7 @@ from pi_agent_core.types import (
 )
 from pi_logger import get_logger
 
-from .tools import create_coding_tools
+from .session import AgentSession, SessionCreateOptions
 
 logger = get_logger("pi_code_agent.cli")
 
@@ -129,24 +129,26 @@ def resolve_model(args: argparse.Namespace):
     return model
 
 
-def build_agent(args: argparse.Namespace) -> Agent:
+def build_session(args: argparse.Namespace) -> AgentSession:
     workspace = Path(args.workspace).resolve()
-    tools = create_coding_tools(workspace)
     model = resolve_model(args)
     logger.info(
-        "[CODE-CLI] building agent workspace=%s tool_count=%s provider=%s model=%s",
+        "[CODE-CLI] building agent session workspace=%s provider=%s model=%s",
         workspace,
-        len(tools),
         model.provider,
         model.id,
     )
-    return Agent(
-        AgentOptions(
-            initial_state={
-                "system_prompt": args.system_prompt,
-                "model": model,
-                "tools": tools,
-            }
+    return AgentSession.create(
+        SessionCreateOptions(
+            workspace=workspace,
+            config_path=args.config,
+            model_config=args.model_config,
+            provider=args.provider,
+            model=args.model,
+            api_key=args.api_key,
+            base_url=args.base_url,
+            custom_system_prompt=args.system_prompt,
+            model_instance=model,
         )
     )
 
@@ -309,21 +311,23 @@ def render_event(event) -> None:
         )
 
 
-async def run_once(agent: Agent, prompt: str) -> None:
+async def run_once(session: AgentSession, prompt: str) -> None:
+    agent = session.agent
     logger.info("[CODE-CLI] run once prompt_len=%s prompt_preview=%r", len(prompt), prompt[:120])
     print("> " + prompt)
-    agent.subscribe(render_event)
+    session.subscribe(render_event)
     start_index = len(agent.state.messages)
-    await agent.prompt(prompt)
+    await session.prompt(prompt)
     _report_prompt_outcome(agent, start_index, "Run once")
     logger.info("[CODE-CLI] run once completed")
     print()
 
 
-async def run_repl(agent: Agent) -> None:
+async def run_repl(session: AgentSession) -> None:
+    agent = session.agent
     logger.info("[CODE-CLI] starting interactive REPL")
     print("Interactive coding agent. Type 'exit' or 'quit' to leave.")
-    agent.subscribe(render_event)
+    session.subscribe(render_event)
     while True:
         try:
             prompt = input("\n> ").strip()
@@ -337,7 +341,7 @@ async def run_repl(agent: Agent) -> None:
             return
         logger.info("[CODE-CLI] REPL prompt_len=%s prompt_preview=%r", len(prompt), prompt[:120])
         start_index = len(agent.state.messages)
-        await agent.prompt(prompt)
+        await session.prompt(prompt)
         _report_prompt_outcome(agent, start_index, "REPL prompt")
         logger.info("[CODE-CLI] REPL prompt completed")
         print()
@@ -355,16 +359,16 @@ async def async_main(argv: Optional[list[str]] = None) -> int:
         args.model,
     )
     try:
-        agent = build_agent(args)
+        session = build_session(args)
     except Exception as exc:
         logger.exception("[CODE-CLI] failed to initialize agent: %s", exc)
         print(f"Failed to initialize agent: {exc}", file=sys.stderr)
         return 1
 
     if args.prompt:
-        await run_once(agent, args.prompt)
+        await run_once(session, args.prompt)
     else:
-        await run_repl(agent)
+        await run_repl(session)
     logger.info("[CODE-CLI] finished successfully")
     return 0
 

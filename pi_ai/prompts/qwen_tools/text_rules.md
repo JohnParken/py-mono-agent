@@ -14,3 +14,5 @@ Arguments must be valid JSON with double-quoted keys and strings.
 
 Prefer one informative tool call per turn. If the path is unknown, search first.
 If the path is known, read directly. Before editing, read the relevant file content first.
+When changing multiple separate locations in one file, prefer a single edit_file
+call with an edits[] array instead of multiple edit_file calls.

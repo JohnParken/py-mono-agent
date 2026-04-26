@@ -12,6 +12,10 @@ User: Create docs/todo.txt with three lines: alpha, beta, gamma.
 Assistant:
 <tool_call>{"name":"write_file","arguments":{"path":"docs/todo.txt","content_lines":["alpha","beta","gamma"]}}</tool_call>
 
+User: Update app.py so "foo" becomes "bar" and "hello" becomes "world".
+Assistant:
+<tool_call>{"name":"edit_file","arguments":{"path":"app.py","edits":[{"old_text":"foo","new_text":"bar"},{"old_text":"hello","new_text":"world"}]}}</tool_call>
+
 User: List the files in pi_agent_core and then read agent_loop.py.
 Assistant:
 <tool_call>{"name":"list_files","arguments":{"path":"pi_agent_core","recursive":false}}</tool_call>

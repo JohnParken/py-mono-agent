@@ -1,9 +1,11 @@
 import unittest
+import tempfile
 
 from pydantic import BaseModel
 
 from pi_ai.llm import QwenLLMProvider, Model
 from pi_ai.types import AssistantMessage, TextContent, ToolCall, ToolResultMessage
+from pi_code_agent.tools import create_coding_tools
 
 
 class EchoArgs(BaseModel):
@@ -255,6 +257,74 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0].arguments, {})
         self.assertIsNotNone(tool_calls[0].parse_error)
+
+    def test_construct_request_exposes_edit_file_edits_schema_in_text_and_native_modes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            edit_tool = next(
+                tool for tool in create_coding_tools(tmpdir) if tool.name == "edit_file"
+            )
+            native_model = Model(
+                provider="QwenLLMprovider",
+                id="qwen3.6-35b-a3b-instruct",
+            )
+
+            text_payload = self.provider.construct_request(
+                model=self.model,
+                messages=[],
+                system_prompt="You are a tool-using assistant.",
+                tools=[edit_tool],
+                api_key="dash-token",
+                tool_calling_mode="text",
+            )
+            native_payload = self.provider.construct_request(
+                model=native_model,
+                messages=[],
+                system_prompt="You are a tool-using assistant.",
+                tools=[edit_tool],
+                api_key="dash-token",
+                tool_calling_mode="native",
+            )
+
+            text_prompt = text_payload["variable"][0]["value"]
+            self.assertIn('"name": "edit_file"', text_prompt)
+            self.assertIn('"edits"', text_prompt)
+            self.assertIn("single edit_file", text_prompt)
+
+            native_schema = native_payload["data"]["tools"][0]["function"]["parameters"]
+            self.assertIn("edits", native_schema["properties"])
+            edit_block_schema = native_schema["$defs"]["EditBlock"]
+            self.assertEqual(
+                edit_block_schema["properties"]["old_text"]["type"],
+                "string",
+            )
+            self.assertEqual(
+                edit_block_schema["properties"]["new_text"]["type"],
+                "string",
+            )
+
+    def test_extract_text_tool_calls_recovers_edit_file_edits_array(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            edit_tool = next(
+                tool for tool in create_coding_tools(tmpdir) if tool.name == "edit_file"
+            )
+            text = (
+                '<tool_call>{"name":"edit_file","arguments":{"path":"app.py","edits":['
+                '{"old_text":"foo","new_text":"bar"},'
+                '{"old_text":"hello","new_text":"world"}]}}</tool_call>'
+            )
+
+            tool_calls = self.provider._extract_text_tool_calls(text, [edit_tool])
+
+            self.assertEqual(len(tool_calls), 1)
+            self.assertEqual(tool_calls[0].name, "edit_file")
+            self.assertEqual(tool_calls[0].arguments["path"], "app.py")
+            self.assertEqual(
+                tool_calls[0].arguments["edits"],
+                [
+                    {"old_text": "foo", "new_text": "bar"},
+                    {"old_text": "hello", "new_text": "world"},
+                ],
+            )
 
     async def test_stream_waits_for_finish_reason_and_accepts_dict_arguments(self):
         chunks = [

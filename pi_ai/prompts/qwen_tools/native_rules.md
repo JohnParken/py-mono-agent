@@ -10,8 +10,9 @@ Use list_files to inspect directories, search_code to locate files or symbols wh
 the path is unknown, and read_file when the path is known.
 
 Use edit_file only after reading the file and only for targeted replacements.
+When changing multiple separate locations in one file, prefer a single edit_file
+call with an edits[] array instead of multiple edit_file calls.
 Use write_file for new files or full rewrites. For multiline content, prefer
 content_lines when appropriate.
 
 After code changes, use run_command when validation would reduce uncertainty.
-
