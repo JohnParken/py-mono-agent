@@ -67,7 +67,7 @@ class LLMConfig:
         with open(path, "r", encoding="utf-8") as f:
             self._config = yaml.safe_load(f)
 
-        self.logger.info(f"加载配置: {config_path}")
+        self.logger.debug(f"加载配置: {config_path}")
         self.logger.debug(f"可用配置: {list(self._config.get('llms', {}).keys())}")
 
     def get_current_name(self) -> str:
@@ -89,7 +89,7 @@ class LLMConfig:
             )
 
         self._config["use_llm"] = name
-        self.logger.info(f"切换到配置: {name}")
+        self.logger.debug(f"切换到配置: {name}")
 
     def get_model(self, name: Optional[str] = None) -> Model:
         """
@@ -134,7 +134,7 @@ class LLMConfig:
             base_url=_resolve_env_value(config.get("base_url")),
         )
 
-        self.logger.info(
+        self.logger.debug(
             f"加载模型: {name} -> {model.id}",
             tag=config.get("provider", "")
         )

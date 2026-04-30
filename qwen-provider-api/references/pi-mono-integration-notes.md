@@ -49,7 +49,6 @@ Keep this rough order in the TS provider file:
 Prefer these auxiliary files when the user wants maintainable code:
 
 - `packages/ai/src/providers/qwen-wrapper-prompts/shared.ts`
-- `packages/ai/src/providers/qwen-wrapper-prompts/native.ts`
 - `packages/ai/src/providers/qwen-wrapper-prompts/text.ts`
 
 If the user wants a single-file provider for bootstrapping, embed prompt strings but keep
@@ -59,10 +58,7 @@ the helper functions clearly separated and labeled.
 
 At minimum, test:
 
-- request construction in native mode
 - request construction in text mode
-- native prompt excludes text protocol
 - text prompt includes `<tool_call>` protocol
-- native failure falls back to text
+- unsupported tool-calling modes resolve to text
 - text parser recovers wrapped JSON tool calls
-

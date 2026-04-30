@@ -50,11 +50,11 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<tool_call>", payload["variable"][0]["value"])
         self.assertNotIn("tools", payload["data"])
 
-    def test_construct_request_native_mode_uses_api_tools(self):
-        native_model = Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct")
+    def test_construct_request_unsupported_mode_falls_back_to_text(self):
+        qwen_model = Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct")
 
         payload = self.provider.construct_request(
-            model=native_model,
+            model=qwen_model,
             messages=[],
             system_prompt="You are a tool-using assistant.",
             tools=[DummyTool()],
@@ -62,17 +62,17 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
             tool_calling_mode="native",
         )
 
-        self.assertEqual(payload["data"]["tools"][0]["function"]["name"], "echo")
-        native_prompt = payload["variable"][0]["value"]
-        self.assertEqual(native_prompt, "")
-        self.assertNotIn("<tool_call>", native_prompt)
-        self.assertNotIn("<tools>", native_prompt)
+        self.assertNotIn("tools", payload["data"])
+        text_prompt = payload["variable"][0]["value"]
+        self.assertIn("# Text Fallback Tool Protocol", text_prompt)
+        self.assertIn("<tools>", text_prompt)
+        self.assertIn("<tool_call>", text_prompt)
 
-    def test_construct_request_auto_mode_resolves_to_native_for_supported_models(self):
-        native_model = Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct")
+    def test_construct_request_auto_mode_resolves_to_text_for_supported_models(self):
+        qwen_model = Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct")
 
         payload = self.provider.construct_request(
-            model=native_model,
+            model=qwen_model,
             messages=[],
             system_prompt="You are a tool-using assistant.",
             tools=[DummyTool()],
@@ -80,17 +80,16 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
             tool_calling_mode="auto",
         )
 
-        self.assertEqual(payload["data"]["tools"][0]["function"]["name"], "echo")
+        self.assertNotIn("tools", payload["data"])
         auto_prompt = payload["variable"][0]["value"]
-        self.assertEqual(auto_prompt, "")
-        self.assertNotIn("<tool_call>", auto_prompt)
-        self.assertNotIn("<tools>", auto_prompt)
+        self.assertIn("# Text Fallback Tool Protocol", auto_prompt)
+        self.assertIn("<tool_call>", auto_prompt)
 
-    def test_construct_request_native_mode_is_case_insensitive(self):
-        native_model = Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct")
+    def test_construct_request_unsupported_mode_is_case_insensitive(self):
+        qwen_model = Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct")
 
         payload = self.provider.construct_request(
-            model=native_model,
+            model=qwen_model,
             messages=[],
             system_prompt="You are a tool-using assistant.",
             tools=[DummyTool()],
@@ -98,11 +97,10 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
             tool_calling_mode="NATIVE",
         )
 
-        self.assertEqual(payload["data"]["tools"][0]["function"]["name"], "echo")
-        native_prompt = payload["variable"][0]["value"]
-        self.assertEqual(native_prompt, "")
-        self.assertNotIn("<tool_call>", native_prompt)
-        self.assertNotIn("<tools>", native_prompt)
+        self.assertNotIn("tools", payload["data"])
+        text_prompt = payload["variable"][0]["value"]
+        self.assertIn("# Text Fallback Tool Protocol", text_prompt)
+        self.assertIn("<tool_call>", text_prompt)
 
     def test_construct_request_text_mode_does_not_inject_tool_interactions(self):
         assistant_message = AssistantMessage(
@@ -163,7 +161,7 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(payload["appInfo"]["prompt"].count("(static_memory)"), 1)
 
-    def test_construct_request_native_messages_match_openai_compatible_shape(self):
+    def test_construct_request_text_messages_match_openai_compatible_shape(self):
         assistant_message = AssistantMessage(
             content=[
                 TextContent(text="I will inspect the file."),
@@ -187,13 +185,18 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
             tool_calling_mode="native",
         )
 
-        native_messages = payload["data"]["messages"]
-        self.assertEqual(native_messages[0]["role"], "assistant")
-        self.assertIsInstance(native_messages[0].get("content"), str)
-        self.assertIn("tool_calls", native_messages[0])
-        self.assertEqual(native_messages[1]["role"], "tool")
-        self.assertEqual(native_messages[1]["content"], "ok")
-        self.assertEqual(native_messages[1]["tool_call_id"], "call_1")
+        api_messages = payload["data"]["messages"]
+        self.assertEqual(api_messages[0]["role"], "system")
+        self.assertIn("You are a tool-using assistant.", api_messages[0]["content"])
+        self.assertEqual(api_messages[1]["role"], "assistant")
+        self.assertIsInstance(api_messages[1].get("content"), list)
+        self.assertIn("tool_calls", api_messages[1])
+        self.assertEqual(api_messages[2]["role"], "tool")
+        self.assertEqual(
+            api_messages[2]["content"],
+            [{"type": "text", "text": "ok"}],
+        )
+        self.assertEqual(api_messages[2]["tool_call_id"], "call_1")
 
     def test_build_messages_keeps_assistant_tool_calls(self):
         assistant_message = AssistantMessage(
@@ -258,14 +261,10 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_calls[0].arguments, {})
         self.assertIsNotNone(tool_calls[0].parse_error)
 
-    def test_construct_request_exposes_edit_file_edits_schema_in_text_and_native_modes(self):
+    def test_construct_request_exposes_edit_file_edits_schema_in_text_mode(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             edit_tool = next(
                 tool for tool in create_coding_tools(tmpdir) if tool.name == "edit_file"
-            )
-            native_model = Model(
-                provider="QwenLLMprovider",
-                id="qwen3.6-35b-a3b-instruct",
             )
 
             text_payload = self.provider.construct_request(
@@ -276,31 +275,11 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
                 api_key="dash-token",
                 tool_calling_mode="text",
             )
-            native_payload = self.provider.construct_request(
-                model=native_model,
-                messages=[],
-                system_prompt="You are a tool-using assistant.",
-                tools=[edit_tool],
-                api_key="dash-token",
-                tool_calling_mode="native",
-            )
 
             text_prompt = text_payload["variable"][0]["value"]
             self.assertIn('"name": "edit_file"', text_prompt)
             self.assertIn('"edits"', text_prompt)
-            self.assertIn("single edit_file", text_prompt)
-
-            native_schema = native_payload["data"]["tools"][0]["function"]["parameters"]
-            self.assertIn("edits", native_schema["properties"])
-            edit_block_schema = native_schema["$defs"]["EditBlock"]
-            self.assertEqual(
-                edit_block_schema["properties"]["old_text"]["type"],
-                "string",
-            )
-            self.assertEqual(
-                edit_block_schema["properties"]["new_text"]["type"],
-                "string",
-            )
+            self.assertIn("Example 5: Editing a file", text_prompt)
 
     def test_extract_text_tool_calls_recovers_edit_file_edits_array(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -393,7 +372,7 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_calls[0].name, "echo")
         self.assertEqual(tool_calls[0].arguments, {"text": "hello"})
 
-    async def test_stream_native_merges_incremental_tool_call_fragments(self):
+    async def test_stream_merges_incremental_tool_call_fragments_in_text_mode(self):
         chunks = [
             {
                 "output": {
@@ -599,7 +578,7 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_calls[0].name, "echo")
         self.assertEqual(tool_calls[0].arguments, {"text": "hello"})
 
-    async def test_stream_skips_blank_native_tool_calls(self):
+    async def test_stream_skips_blank_tool_calls(self):
         chunks = [
             {
                 "output": {
@@ -741,13 +720,10 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_calls[0].name, "echo")
         self.assertEqual(tool_calls[0].arguments, {"text": "hello"})
 
-    async def test_stream_native_request_failure_falls_back_to_text_mode(self):
-        native_model = Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct")
+    async def test_stream_handles_tool_call_streams_in_text_mode(self):
+        qwen_model = Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct")
 
         async def fake_stream_request(**kwargs):
-            payload = kwargs["payload"]
-            if payload["data"].get("tools"):
-                raise RuntimeError("native tools unsupported")
             yield {
                 "output": {
                     "choices": [
@@ -768,7 +744,7 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
 
         events = []
         async for event in self.provider.stream(
-            model=native_model,
+            model=qwen_model,
             messages=[],
             system_prompt="You are a tool-using assistant.",
             tools=[DummyTool()],
@@ -785,33 +761,10 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_calls[0].name, "echo")
         self.assertEqual(tool_calls[0].arguments, {"text": "fallback"})
 
-    async def test_stream_native_blank_tool_calls_falls_back_to_text_mode(self):
-        native_model = Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct")
+    async def test_stream_blank_tool_calls_still_yield_tool_use(self):
+        qwen_model = Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct")
 
         async def fake_stream_request(**kwargs):
-            payload = kwargs["payload"]
-            if payload["data"].get("tools"):
-                yield {
-                    "output": {
-                        "choices": [
-                            {
-                                "message": {
-                                    "tool_calls": [
-                                        {
-                                            "id": "call_blank",
-                                            "function": {
-                                                "name": "",
-                                                "arguments": {"text": "ignored"},
-                                            },
-                                        }
-                                    ]
-                                },
-                                "finish_reason": "tool_calls",
-                            }
-                        ]
-                    }
-                }
-                return
             yield {
                 "output": {
                     "choices": [
@@ -832,7 +785,7 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
 
         events = []
         async for event in self.provider.stream(
-            model=native_model,
+            model=qwen_model,
             messages=[],
             system_prompt="You are a tool-using assistant.",
             tools=[DummyTool()],

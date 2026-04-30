@@ -69,8 +69,6 @@ interface QwenChunk {
 const DEFAULT_BASE_URL =
 	"https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation";
 
-const NATIVE_MODEL_PREFIXES = ["qwen3.6-35b-a3b"];
-
 export const streamQwenWrapper: StreamFunction<"qwen-wrapper", QwenWrapperOptions> = (
 	model: Model<"qwen-wrapper">,
 	context: Context,
@@ -98,21 +96,6 @@ export const streamQwenWrapper: StreamFunction<"qwen-wrapper", QwenWrapperOption
 		};
 
 		try {
-			const resolvedMode = resolveToolCallingMode(model.id, context.tools || [], options?.toolCallingMode);
-			const nativeFirst = resolvedMode === "native";
-
-			if (nativeFirst) {
-				const nativeAttempt = await collectAttempt(model, context, {
-					...options,
-					toolCallingMode: "native",
-				});
-				if (!nativeAttempt.error && !requiresTextFallback(nativeAttempt.events)) {
-					for (const event of nativeAttempt.events) stream.push(event);
-					stream.end();
-					return;
-				}
-			}
-
 			const textAttempt = await collectAttempt(model, context, {
 				...options,
 				toolCallingMode: "text",
@@ -253,7 +236,7 @@ async function* streamOnce(
 
 		const rawToolCalls = message.tool_calls || [];
 		for (const rawToolCall of rawToolCalls) {
-			const toolCall = normalizeNativeToolCall(rawToolCall);
+			const toolCall = normalizeToolCall(rawToolCall);
 			if (!toolCall) continue;
 			partial.content.push(toolCall);
 			const ci = partial.content.length - 1;
@@ -326,7 +309,7 @@ function constructRequest(
 	context: Context,
 	options: QwenWrapperOptions,
 ): QwenRequestTemplate {
-	const mode = options.toolCallingMode === "native" ? "native" : "text";
+	const mode = resolveToolCallingMode(context.tools || [], options.toolCallingMode);
 	const tools = context.tools || [];
 	const apiTools = buildTools(tools);
 	const template = cloneJson(
@@ -356,28 +339,18 @@ function constructRequest(
 
 	template.data ||= {};
 	template.data.stream = true;
-	template.data.messages =
-		mode === "native"
-			? buildNativeMessages(context.messages)
-			: buildMessages(context.messages);
-	if (mode === "native" && apiTools.length) template.data.tools = apiTools;
-	else delete template.data.tools;
+	template.data.messages = buildMessages(context.messages);
+	delete template.data.tools;
 	return template;
 }
 
-function buildPrompt(systemPrompt: string, apiTools: unknown[], mode: "native" | "text"): string {
+function buildPrompt(systemPrompt: string, apiTools: unknown[], mode: "text"): string {
 	const shared = [
 		"When repository inspection is needed, do not guess.",
 		"If the exact path is unknown, search first.",
 		"Before editing a file, read the relevant content first.",
 		"If a tool call fails, adjust the next call instead of repeating it unchanged.",
 	].join("\n");
-
-	if (mode === "native") {
-		return [systemPrompt, shared, "Use native tool calling when tools are needed."]
-			.filter(Boolean)
-			.join("\n\n");
-	}
 
 	const toolsBlock = apiTools.map((tool) => JSON.stringify(tool, null, 2)).join("\n");
 	return [
@@ -442,50 +415,6 @@ function buildMessages(messages: Message[]): unknown[] {
 	});
 }
 
-function buildNativeMessages(messages: Message[]): unknown[] {
-	return messages.map((message) => {
-		if (message.role === "user") {
-			const text = typeof message.content === "string"
-				? message.content
-				: message.content
-						.filter((block) => block.type === "text")
-						.map((block: any) => block.text)
-						.join("");
-			return { role: "user", content: text };
-		}
-		if (message.role === "assistant") {
-			const text = message.content
-				.filter((block) => block.type === "text")
-				.map((block: any) => block.text)
-				.join("");
-			const toolCalls = message.content
-				.filter((block) => block.type === "toolCall")
-				.map((block: any) => ({
-					id: block.id,
-					type: "function",
-					function: {
-						name: block.name,
-						arguments: JSON.stringify(block.arguments),
-					},
-				}));
-			return {
-				role: "assistant",
-				...(text ? { content: text } : {}),
-				...(toolCalls.length ? { tool_calls: toolCalls } : {}),
-			};
-		}
-		const toolMessage = message as ToolResultMessage;
-		return {
-			role: "tool",
-			tool_call_id: toolMessage.toolCallId,
-			content: toolMessage.content
-				.filter((block) => block.type === "text")
-				.map((block: any) => block.text)
-				.join("\n"),
-		};
-	});
-}
-
 function buildUserContent(content: Message["content"]): unknown[] | string {
 	if (typeof content === "string") return content;
 	return content.map((block: any) =>
@@ -499,23 +428,13 @@ function buildUserContent(content: Message["content"]): unknown[] | string {
 	);
 }
 
-function resolveToolCallingMode(modelId: string, tools: Tool[], requested = "auto"): "native" | "text" {
+function resolveToolCallingMode(tools: Tool[], requested = "auto"): "text" {
 	if (!tools.length) return "text";
-	if (requested === "native") return "native";
-	if (requested === "text") return "text";
-	return NATIVE_MODEL_PREFIXES.some((prefix) => modelId.toLowerCase().startsWith(prefix))
-		? "native"
-		: "text";
+	void requested;
+	return "text";
 }
 
-function requiresTextFallback(events: any[]): boolean {
-	const doneEvent = [...events].reverse().find((event) => event.type === "done");
-	if (!doneEvent) return false;
-	const toolCalls = (doneEvent.message?.content || []).filter((block: any) => block.type === "toolCall");
-	return doneEvent.reason === "toolUse" && toolCalls.length === 0;
-}
-
-function normalizeNativeToolCall(rawToolCall: any): ToolCall | null {
+function normalizeToolCall(rawToolCall: any): ToolCall | null {
 	const fn = rawToolCall?.function || {};
 	const name = fn.name || rawToolCall?.name;
 	if (!name) return null;

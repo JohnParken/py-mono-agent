@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-QwenToolPromptMode = Literal["native", "text"]
+QwenToolPromptMode = Literal["text"]
 
 
 @dataclass(frozen=True)
@@ -16,4 +16,3 @@ class QwenToolPromptOptions:
     system_prompt: str
     mode: QwenToolPromptMode
     include_fewshots: bool = False
-

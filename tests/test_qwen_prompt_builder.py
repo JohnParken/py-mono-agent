@@ -43,7 +43,7 @@ class QwenPromptBuilderTests(unittest.TestCase):
         self.assertIn("# Examples", prompt)
         self.assertIn('"name": "echo"', prompt)
 
-    def test_native_prompt_contains_shared_and_native_rules_without_text_protocol(self):
+    def test_unsupported_mode_is_aliased_to_text_prompt(self):
         prompt = build_qwen_tool_prompt(
             "You are a tool-using assistant.",
             [],
@@ -53,10 +53,8 @@ class QwenPromptBuilderTests(unittest.TestCase):
 
         self.assertIn("You are a tool-using assistant.", prompt)
         self.assertIn("# Shared Tool Use Rules", prompt)
-        self.assertIn("# Native Tool Calling Rules", prompt)
-        self.assertNotIn("<tools>", prompt)
-        self.assertNotIn("<tool_call>", prompt)
-        self.assertNotIn("# Examples", prompt)
+        self.assertIn("# Text Fallback Tool Protocol", prompt)
+        self.assertIn("<tool_call>", prompt)
 
 
 if __name__ == "__main__":

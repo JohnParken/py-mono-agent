@@ -42,8 +42,8 @@ def build_qwen_tool_prompt(
     mode: str,
     include_fewshots: bool = False,
 ) -> str:
-    """Build the full tool prompt for Qwen native or text mode."""
-    resolved_mode = "native" if str(mode).lower() == "native" else "text"
+    """Build the full tool prompt for Qwen text mode."""
+    resolved_mode = "text"
     options = QwenToolPromptOptions(
         system_prompt=system_prompt or "",
         mode=resolved_mode,
@@ -51,7 +51,7 @@ def build_qwen_tool_prompt(
     )
 
     shared_rules = _load_text_resource("shared_rules.md")
-    mode_rules = _load_text_resource(f"{options.mode}_rules.md")
+    mode_rules = _load_text_resource("text_rules.md")
     sections: List[str] = [options.system_prompt, shared_rules, mode_rules]
 
     tools_block = _render_tools_block(api_tools)
@@ -59,15 +59,14 @@ def build_qwen_tool_prompt(
         sections.append(tools_block)
 
     if options.include_fewshots:
-        fewshots = _load_text_resource(f"{options.mode}_fewshots.md")
+        fewshots = _load_text_resource("text_fewshots.md")
         if fewshots:
             sections.append(fewshots)
 
-    if options.mode == "text":
-        sections.append(
-            "If a tool is needed, output one or more "
-            "<tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call> blocks. "
-            "When multiple tools are needed, place each in its own <tool_call> block on a separate line."
-        )
+    sections.append(
+        "If a tool is needed, output one or more "
+        "<tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call> blocks. "
+        "When multiple tools are needed, place each in its own <tool_call> block on a separate line."
+    )
 
     return _join_sections(sections)

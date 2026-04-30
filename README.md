@@ -602,12 +602,12 @@ agent = Agent(
 )
 ```
 
-### 4.1 Qwen `native/text` 模式开关
+### 4.1 Qwen 工具调用模式
 
 `QwenLLMProvider` 的工具调用模式开关是运行时参数 `tool_calling_mode`，不是 YAML 固定字段。
 
-- `tool_calling_mode="auto"`: 默认值。若模型 ID 命中 `qwen3.6-35b-a3b*`，先走 `native`，失败后自动回退 `text`。
-- `tool_calling_mode="native"`: 强制原生 Function Calling（请求体携带 `data.tools`）。
+- `tool_calling_mode="auto"`: 默认值，当前与 `text` 等价。
+- `tool_calling_mode="native"`: 兼容旧调用的保留值，当前会自动降级为 `text`。
 - `tool_calling_mode="text"`: 强制文本协议（不发送 `data.tools`，使用 `<tools>/<tool_call>` 提示词格式）。
 
 直接调用 `stream_simple` 时：
@@ -624,7 +624,7 @@ response = await stream_simple(
         "messages": messages,
         "tools": tools,
     },
-    tool_calling_mode="text",  # "auto" | "native" | "text"
+    tool_calling_mode="text",  # 推荐值；"auto" 与 "native" 当前都会按 "text" 处理
     static_memory=(
         "Project Facts:\\n"
         "- Repository root is /workspace\\n"
@@ -644,7 +644,7 @@ async def qwen_stream(model, context, **opts):
     return await stream_simple(
         model,
         context,
-        tool_calling_mode="text",  # "auto" | "native" | "text"
+        tool_calling_mode="text",  # 推荐值；"auto" 与 "native" 当前都会按 "text" 处理
         **opts,
     )
 

@@ -102,7 +102,7 @@ def resolve_model(args: argparse.Namespace):
             api_key=args.api_key,
             base_url=args.base_url,
         )
-        logger.info(
+        logger.debug(
             "[CODE-CLI] resolved direct model provider=%s model=%s base_url=%s has_api_key=%s",
             model.provider,
             model.id,
@@ -113,13 +113,13 @@ def resolve_model(args: argparse.Namespace):
 
     config = get_llm_config(args.config)
     model_name = args.model_config or config.get_current_name()
-    logger.info(
+    logger.debug(
         "[CODE-CLI] resolving model from config config_path=%s model_config=%s",
         args.config,
         model_name,
     )
     model = config.get_model(args.model_config)
-    logger.info(
+    logger.debug(
         "[CODE-CLI] resolved configured model provider=%s model=%s base_url=%s has_api_key=%s",
         model.provider,
         model.id,
@@ -132,7 +132,7 @@ def resolve_model(args: argparse.Namespace):
 def build_session(args: argparse.Namespace) -> AgentSession:
     workspace = Path(args.workspace).resolve()
     model = resolve_model(args)
-    logger.info(
+    logger.debug(
         "[CODE-CLI] building agent session workspace=%s provider=%s model=%s",
         workspace,
         model.provider,
@@ -193,7 +193,7 @@ def _report_prompt_outcome(agent: Agent, start_index: int, source: str) -> None:
         if getattr(message, "role", None) == "assistant"
     ]
 
-    logger.info(
+    logger.debug(
         "%s outcome new_messages=%s assistant_messages=%s state_error=%r",
         source,
         len(new_messages),
@@ -211,7 +211,7 @@ def _report_prompt_outcome(agent: Agent, start_index: int, source: str) -> None:
         return
 
     last_assistant = assistant_messages[-1]
-    logger.info("%s last assistant %s", source, _describe_message(last_assistant))
+    logger.debug("%s last assistant %s", source, _describe_message(last_assistant))
 
     error_message = getattr(last_assistant, "error_message", None)
     if error_message:
@@ -222,7 +222,7 @@ def _report_prompt_outcome(agent: Agent, start_index: int, source: str) -> None:
     text = _message_text(last_assistant)
     tool_calls = _message_tool_call_count(last_assistant)
     if text.strip():
-        logger.info(
+        logger.debug(
             "%s assistant produced visible text text_len=%s preview=%r",
             source,
             len(text),
@@ -231,7 +231,7 @@ def _report_prompt_outcome(agent: Agent, start_index: int, source: str) -> None:
         return
 
     if tool_calls:
-        logger.info("%s assistant finished with tool calls only tool_calls=%s", source, tool_calls)
+        logger.debug("%s assistant finished with tool calls only tool_calls=%s", source, tool_calls)
         return
 
     logger.warning("%s assistant finished without visible text or tool calls", source)
@@ -242,32 +242,13 @@ def render_event(event) -> None:
     if isinstance(event, MessageUpdateEvent):
         assistant_event = event.assistant_message_event
         event_type = getattr(assistant_event, "type", None)
-        logger.debug("[CODE-CLI] assistant event type=%s", event_type)
         if getattr(assistant_event, "type", None) == "text_delta":
             print(assistant_event.delta, end="", flush=True)
-        elif event_type == "text_start":
-            logger.debug("[CODE-CLI] assistant text stream started")
-        elif event_type == "text_end":
-            logger.debug("[CODE-CLI] assistant text stream ended")
-        elif event_type == "thinking_start":
-            logger.debug("[CODE-CLI] assistant thinking started")
-        elif event_type == "thinking_delta":
-            logger.debug("[CODE-CLI] assistant thinking delta received")
-        elif event_type == "thinking_end":
-            logger.debug("[CODE-CLI] assistant thinking ended")
-        elif event_type == "toolcall_start":
-            logger.debug("[CODE-CLI] assistant tool call started")
-        elif event_type == "toolcall_delta":
-            logger.debug("[CODE-CLI] assistant tool call delta received")
-        elif event_type == "toolcall_end":
-            logger.debug("[CODE-CLI] assistant tool call ended")
-        elif event_type == "done":
-            logger.info("[CODE-CLI] assistant stream done")
         elif event_type == "error":
             logger.warning("[CODE-CLI] assistant stream error event received")
     elif isinstance(event, MessageEndEvent):
         message = event.message
-        logger.info("[CODE-CLI] message end %s", _describe_message(message))
+        logger.debug("[CODE-CLI] message end %s", _describe_message(message))
         if getattr(message, "role", None) == "assistant":
             error_message = getattr(message, "error_message", None)
             if error_message:
@@ -275,9 +256,9 @@ def render_event(event) -> None:
             else:
                 text = _message_text(message)
                 if text.strip():
-                    logger.debug("[CODE-CLI] assistant final text preview=%r", text[:200])
+                    return
                 elif _message_tool_call_count(message):
-                    logger.info(
+                    logger.debug(
                         "[CODE-CLI] assistant message ended with tool calls only tool_calls=%s",
                         _message_tool_call_count(message),
                     )
@@ -285,17 +266,13 @@ def render_event(event) -> None:
                     logger.warning("[CODE-CLI] assistant message ended empty: %s", _describe_message(message))
                     print("\n[assistant:empty] completed without visible text output", file=sys.stderr)
     elif isinstance(event, ToolExecutionStartEvent):
-        logger.info("[CODE-CLI] tool execution start tool=%s args=%s", event.tool_name, event.args)
+        logger.debug("[CODE-CLI] tool execution start tool=%s args=%s", event.tool_name, event.args)
         print(f"\n[tool:start] {event.tool_name} {event.args}", file=sys.stderr)
     elif isinstance(event, ToolExecutionUpdateEvent):
-        logger.debug(
-            "[CODE-CLI] tool execution update tool=%s partial_result=%s",
-            event.tool_name,
-            event.partial_result,
-        )
+        return
     elif isinstance(event, ToolExecutionEndEvent):
         status = "error" if event.is_error else "ok"
-        logger.info(
+        logger.debug(
             "[CODE-CLI] tool execution end tool=%s status=%s result=%s",
             event.tool_name,
             status,
@@ -304,7 +281,7 @@ def render_event(event) -> None:
         print(f"[tool:end] {event.tool_name} ({status})", file=sys.stderr)
     elif isinstance(event, AgentEndEvent):
         last_message = event.messages[-1] if event.messages else None
-        logger.info(
+        logger.debug(
             "[CODE-CLI] agent end messages=%s last_message=%s",
             len(event.messages),
             _describe_message(last_message),
@@ -313,19 +290,19 @@ def render_event(event) -> None:
 
 async def run_once(session: AgentSession, prompt: str) -> None:
     agent = session.agent
-    logger.info("[CODE-CLI] run once prompt_len=%s prompt_preview=%r", len(prompt), prompt[:120])
+    logger.debug("[CODE-CLI] run once prompt_len=%s prompt_preview=%r", len(prompt), prompt[:120])
     print("> " + prompt)
     session.subscribe(render_event)
     start_index = len(agent.state.messages)
     await session.prompt(prompt)
     _report_prompt_outcome(agent, start_index, "Run once")
-    logger.info("[CODE-CLI] run once completed")
+    logger.debug("[CODE-CLI] run once completed")
     print()
 
 
 async def run_repl(session: AgentSession) -> None:
     agent = session.agent
-    logger.info("[CODE-CLI] starting interactive REPL")
+    logger.debug("[CODE-CLI] starting interactive REPL")
     print("Interactive coding agent. Type 'exit' or 'quit' to leave.")
     session.subscribe(render_event)
     while True:
@@ -337,20 +314,20 @@ async def run_repl(session: AgentSession) -> None:
         if not prompt:
             continue
         if prompt.lower() in {"exit", "quit"}:
-            logger.info("[CODE-CLI] REPL exit requested")
+            logger.debug("[CODE-CLI] REPL exit requested")
             return
-        logger.info("[CODE-CLI] REPL prompt_len=%s prompt_preview=%r", len(prompt), prompt[:120])
+        logger.debug("[CODE-CLI] REPL prompt_len=%s prompt_preview=%r", len(prompt), prompt[:120])
         start_index = len(agent.state.messages)
         await session.prompt(prompt)
         _report_prompt_outcome(agent, start_index, "REPL prompt")
-        logger.info("[CODE-CLI] REPL prompt completed")
+        logger.debug("[CODE-CLI] REPL prompt completed")
         print()
 
 
 async def async_main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    logger.info(
+    logger.debug(
         "[CODE-CLI] start workspace=%s config=%s model_config=%s provider=%s model=%s",
         args.workspace,
         args.config,
@@ -369,7 +346,7 @@ async def async_main(argv: Optional[list[str]] = None) -> int:
         await run_once(session, args.prompt)
     else:
         await run_repl(session)
-    logger.info("[CODE-CLI] finished successfully")
+    logger.debug("[CODE-CLI] finished successfully")
     return 0
 
 

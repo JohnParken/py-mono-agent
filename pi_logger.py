@@ -50,6 +50,10 @@ def configure_logging(level: int | None = None) -> None:
     else:
         root_logger.setLevel(resolved_level)
 
+    # Keep default INFO logs focused on application events rather than
+    # subprocess transport noise from the stdlib event loop.
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
+
 
 def get_logger(name: str) -> _PiLogger:
     configure_logging()

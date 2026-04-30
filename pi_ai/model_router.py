@@ -68,7 +68,7 @@ def create_model_router_from_config() -> Optional[ModelRouter]:
     router_config = config.get_model_router()
     
     if not router_config:
-        logger.info("未配置模型路由，使用单一模型模式")
+        logger.debug("未配置模型路由，使用单一模型模式")
         return None
     
     reasoning_name = router_config.get("reasoning_model")
@@ -85,7 +85,7 @@ def create_model_router_from_config() -> Optional[ModelRouter]:
         logger.error(f"创建模型路由器失败: {e}")
         return None
     
-    logger.info(
+    logger.debug(
         f"模型路由器已创建: reasoning={reasoning_name} ({reasoning_model.id}), "
         f"generation={generation_name} ({generation_model.id})"
     )

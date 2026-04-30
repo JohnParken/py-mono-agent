@@ -184,7 +184,7 @@ BashArgs = ShellArgs
 
 def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
     workspace = Workspace(Path(workspace_root).resolve())
-    logger.info("[CODE-TOOL] creating coding tools for workspace=%s", workspace.root)
+    logger.debug("[CODE-TOOL] creating coding tools for workspace=%s", workspace.root)
 
     async def read_file(
         tool_call_id: str,
@@ -192,7 +192,7 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         cancel_event,
         update_callback,
     ) -> AgentToolResult:
-        logger.info(
+        logger.debug(
             "[CODE-TOOL] read_file start tool_call_id=%s path=%s start_line=%s end_line=%s",
             tool_call_id,
             args.path,
@@ -219,7 +219,7 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
             f"LINES: {start}-{start + max(len(selected) - 1, 0)} of {len(lines)}\n"
             f"{body}"
         )
-        logger.info(
+        logger.debug(
             "[CODE-TOOL] read_file success path=%s selected_lines=%s",
             workspace.display_path(path),
             len(selected),
@@ -232,7 +232,7 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         cancel_event,
         update_callback,
     ) -> AgentToolResult:
-        logger.info(
+        logger.debug(
             "[CODE-TOOL] write_file start tool_call_id=%s path=%s append=%s content_len=%s",
             tool_call_id,
             args.path,
@@ -253,7 +253,7 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         with path.open(mode, encoding="utf-8") as handle:
             handle.write(content)
         action = "Appended to" if args.append else "Wrote"
-        logger.info(
+        logger.debug(
             "[CODE-TOOL] write_file success path=%s action=%s content_len=%s",
             workspace.display_path(path),
             action,
@@ -269,7 +269,7 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         cancel_event,
         update_callback,
     ) -> AgentToolResult:
-        logger.info(
+        logger.debug(
             "[CODE-TOOL] edit_file start tool_call_id=%s path=%s replace_all=%s old_len=%s new_len=%s",
             tool_call_id,
             args.path,
@@ -301,7 +301,7 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
             path.write_text(final_content, encoding="utf-8")
 
         replaced = len(edit_blocks)
-        logger.info(
+        logger.debug(
             "[CODE-TOOL] edit_file success path=%s replaced=%s",
             workspace.display_path(path),
             replaced,
@@ -328,7 +328,7 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         cancel_event,
         update_callback,
     ) -> AgentToolResult:
-        logger.info(
+        logger.debug(
             "[CODE-TOOL] list_files start tool_call_id=%s path=%s recursive=%s max_entries=%s",
             tool_call_id,
             args.path,
@@ -339,7 +339,7 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         if not path.exists():
             raise FileNotFoundError(f"Path not found: {workspace.display_path(path)}")
         if path.is_file():
-            logger.info("[CODE-TOOL] list_files target is file path=%s", workspace.display_path(path))
+            logger.debug("[CODE-TOOL] list_files target is file path=%s", workspace.display_path(path))
             return _result(workspace.display_path(path))
 
         entries = _walk_workspace(path, recursive=args.recursive, max_entries=args.max_entries)
@@ -347,7 +347,7 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         suffix = ""
         if len(entries) >= args.max_entries:
             suffix = f"\n[truncated to first {args.max_entries} entries]"
-        logger.info(
+        logger.debug(
             "[CODE-TOOL] list_files success path=%s entries=%s truncated=%s",
             workspace.display_path(path),
             len(entries),
@@ -361,7 +361,7 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         cancel_event,
         update_callback,
     ) -> AgentToolResult:
-        logger.info(
+        logger.debug(
             "[CODE-TOOL] search_code start tool_call_id=%s path=%s literal=%s max_results=%s pattern=%r",
             tool_call_id,
             args.path,
@@ -391,12 +391,12 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
                     if len(hits) >= args.max_results:
                         break
         if not hits:
-            logger.info("[CODE-TOOL] search_code success path=%s hits=0", workspace.display_path(path))
+            logger.debug("[CODE-TOOL] search_code success path=%s hits=0", workspace.display_path(path))
             return _result("No matches found.")
         suffix = ""
         if len(hits) >= args.max_results:
             suffix = f"\n[truncated to first {args.max_results} matches]"
-        logger.info(
+        logger.debug(
             "[CODE-TOOL] search_code success path=%s hits=%s truncated=%s",
             workspace.display_path(path),
             len(hits),
@@ -410,7 +410,7 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
         cancel_event,
         update_callback,
     ) -> AgentToolResult:
-        logger.info(
+        logger.debug(
             "[CODE-TOOL] run_command start tool_call_id=%s cwd=%s timeout=%s command=%r",
             tool_call_id,
             args.cwd,
@@ -559,7 +559,7 @@ def create_coding_tools(workspace_root: str | Path) -> List[AgentTool]:
             f"Working directory: {workspace.display_path(cwd)}\n"
             f"Output:\n{_truncate(output_text.strip() or '[no output]', MAX_OUTPUT_CHARS)}"
         )
-        logger.info(
+        logger.debug(
             "[CODE-TOOL] run_command success cwd=%s shell=%s exit_code=%s output_len=%s",
             workspace.display_path(cwd),
             shell_name,
