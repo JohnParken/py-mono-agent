@@ -100,7 +100,7 @@ async def parse_error_tool_stream(model, context, **options):
 
 
 class AgentLoopSafetyTests(unittest.IsolatedAsyncioTestCase):
-    async def test_repeated_tool_call_stops_loop(self):
+    async def test_repeated_tool_call_stops_after_five_identical_signatures(self):
         context = AgentContext(
             system_prompt="",
             messages=[],
@@ -124,14 +124,19 @@ class AgentLoopSafetyTests(unittest.IsolatedAsyncioTestCase):
             if event.type == "message_end" and event.message is not None:
                 messages.append(event.message)
 
+        tool_result_messages = [
+            message for message in messages if getattr(message, "role", None) == "toolResult"
+        ]
+
         final_texts = [
             content.text
             for message in messages
             for content in getattr(message, "content", [])
             if getattr(content, "type", None) == "text"
         ]
+        self.assertEqual(len(tool_result_messages), 4)
         self.assertTrue(
-            any("repeated the same tool call" in text for text in final_texts)
+            any("repeated the same tool call with the same arguments 5 times in a row" in text for text in final_texts)
         )
 
     async def test_strict_tool_arguments_returns_structured_error_and_skips_execution(self):
