@@ -9,6 +9,9 @@ __pycache__/
 build/
 dist/
 htmlcov/
+.claude
+*/__pycache__/
+*.pyc
 
 # Local scratch directory created by an earlier uv init attempt.
 py-mono-agent/

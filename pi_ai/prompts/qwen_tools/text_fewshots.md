@@ -53,12 +53,12 @@ User: Fix the bug in the auth module.
 Assistant:
 <tool_call>{"name":"search_code","arguments":{"pattern":"def authenticate","path":".","literal":false}}</tool_call>
 
-User: [Tool result shows auth.py contains the authenticate function]
+Tool: [Tool result shows auth.py contains the authenticate function]
 
 Assistant:
 <tool_call>{"name":"read_file","arguments":{"path":"auth.py","start_line":1}}</tool_call>
 
-User: [Tool result shows file content]
+Tool: [Tool result shows file content]
 
 Assistant:
 <tool_call>{"name":"edit_file","arguments":{"path":"auth.py","edits":[{"old_text":"if not token:","new_text":"if not token or token == '':"}]}}</tool_call>
@@ -72,12 +72,12 @@ User: Add a new test case and run the tests.
 Assistant:
 <tool_call>{"name":"read_file","arguments":{"path":"tests/test_example.py","start_line":1}}</tool_call>
 
-User: [Tool result shows file content]
+Tool: [Tool result shows file content]
 
 Assistant:
 <tool_call>{"name":"edit_file","arguments":{"path":"tests/test_example.py","edits":[{"old_text":"def test_addition():\n    assert add(2, 3) == 5","new_text":"def test_addition():\n    assert add(2, 3) == 5\n\ndef test_subtraction():\n    assert sub(5, 3) == 2"}]}}</tool_call>
 
-User: [Tool result shows edit succeeded]
+Tool: [Tool result shows edit succeeded]
 
 Assistant:
 <tool_call>{"name":"run_command","arguments":{"command":"python -m pytest tests/test_example.py -v","timeout":60}}</tool_call>
