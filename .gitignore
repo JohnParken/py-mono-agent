@@ -14,3 +14,4 @@ htmlcov/
 
 # Local scratch directory created by an earlier uv init attempt.
 py-mono-agent/
+.claude
