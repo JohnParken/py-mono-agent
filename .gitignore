@@ -9,7 +9,7 @@ __pycache__/
 build/
 dist/
 htmlcov/
-.claude
+
 .venv
 
 # Local scratch directory created by an earlier uv init attempt.
