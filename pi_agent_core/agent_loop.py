@@ -86,6 +86,9 @@ def _tool_call_signature(tool_call: ToolCall) -> str:
     return f"{tool_call.name}:{arguments}"
 
 
+REPEATED_TOOL_SIGNATURE_LIMIT = 5
+
+
 def _create_safety_message(text: str) -> AssistantMessage:
     return AssistantMessage(
         content=[TextContent(text=text)],
@@ -311,6 +314,7 @@ async def _run_loop(
     first_turn = True
     tool_iteration_count = 0
     previous_tool_signature: Optional[str] = None
+    repeated_tool_signature_count = 0
 
     # 检查是否有 steering 消息（用户可能在等待期间输入了内容）
     pending_messages: List[AgentMessage] = []
@@ -390,14 +394,22 @@ async def _run_loop(
                     return
 
                 if previous_tool_signature == current_signature:
+                    repeated_tool_signature_count += 1
+                else:
+                    previous_tool_signature = current_signature
+                    repeated_tool_signature_count = 1
+
+                if repeated_tool_signature_count >= REPEATED_TOOL_SIGNATURE_LIMIT:
                     safety_message = _create_safety_message(
                         "Stopped tool execution because the model repeated the same "
-                        "tool call with the same arguments. Please inspect the latest "
-                        "tool result and continue without repeating it."
+                        f"tool call with the same arguments {REPEATED_TOOL_SIGNATURE_LIMIT} "
+                        "times in a row. Please inspect the latest tool result and "
+                        "continue without repeating it."
                     )
                     logger.warning(
-                        "[AGENT-TOOLS] stopping loop repeated_tool_calls=%s",
+                        "[AGENT-TOOLS] stopping loop repeated_tool_calls=%s repeat_count=%s",
                         [_summarize_tool_call_for_log(tool_call) for tool_call in tool_calls],
+                        repeated_tool_signature_count,
                     )
                     current_context.messages.append(safety_message)
                     new_messages.append(safety_message)
@@ -408,7 +420,6 @@ async def _run_loop(
                     stream.end(new_messages)
                     return
 
-                previous_tool_signature = current_signature
                 tool_execution = await _execute_tool_calls(
                     current_context.tools,
                     message,
@@ -426,6 +437,7 @@ async def _run_loop(
             else:
                 tool_iteration_count = 0
                 previous_tool_signature = None
+                repeated_tool_signature_count = 0
 
             stream.push(TurnEndEvent(message=message, tool_results=tool_results))
 

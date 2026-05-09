@@ -798,16 +798,18 @@ class QwenLLMProvider:
                 app_info["prompt"] = "(static_memory)"
 
         api_tools = self._build_tools(tools) if tools else []
-        prompt_variable_value = (
-            ""
-            if resolved_tool_calling_mode == "native"
-            else self._build_sys_prompt_content(
+        prompt_variable_value = ""
+        text_mode_system_prompt = system_prompt
+        if resolved_tool_calling_mode != "native":
+            # In the current Light/Qwen wrapper path, tool registration happens by
+            # expanding the full protocol prompt into the first system message rather
+            # than by sending API-native `data.tools`.
+            text_mode_system_prompt = self._build_sys_prompt_content(
                 system_prompt=system_prompt,
                 messages=messages,
                 api_tools=api_tools,
                 tool_calling_mode=resolved_tool_calling_mode,
             )
-        )
         payload["variable"] = self._build_variables(
             prompt_variable_value,
             static_memory_content=static_memory,
@@ -818,7 +820,10 @@ class QwenLLMProvider:
         if resolved_tool_calling_mode == "native":
             data["messages"] = self._build_native_messages(messages)
         else:
-            data["messages"] = self._build_messages(messages, system_prompt)
+            # Text mode keeps the wrapper contract stable: tools are described in the
+            # first system message, while `data.messages` carries the conversational
+            # history that the model uses to plan the next tool call.
+            data["messages"] = self._build_messages(messages, text_mode_system_prompt)
         if resolved_tool_calling_mode == "native" and api_tools:
             data["tools"] = self._deep_copy_json_value(api_tools)
         else:
@@ -936,6 +941,17 @@ class QwenLLMProvider:
     ) -> List[Dict[str, Any]]:
         api_messages: List[Dict[str, Any]] = []
 
+        if system_prompt:
+            # The first system message is the primary tool-registration surface for the
+            # current text-mode provider. It contains both behavioral rules and the
+            # rendered `<tools>...</tools>` block.
+            api_messages.append(
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                }
+            )
+
         for msg in messages:
             if msg.role == "user":
                 api_messages.append(
@@ -947,29 +963,15 @@ class QwenLLMProvider:
 
             elif msg.role == "assistant":
                 assistant_msg: Dict[str, Any] = {"role": "assistant"}
-                content_parts = self._build_message_content(msg.content)
+                # Replaying prior tool calls as text keeps the model aware of what it
+                # already requested in earlier turns. Without this, repeated-tool-loop
+                # safeguards are triggered much more often.
+                content_parts = self._build_message_content(
+                    msg.content,
+                    include_tool_calls_text=True,
+                )
                 if content_parts:
                     assistant_msg["content"] = content_parts
-
-                tool_calls_list = []
-                for content in msg.content:
-                    if getattr(content, "type", None) != "toolCall":
-                        continue
-                    tool_calls_list.append(
-                        {
-                            "id": getattr(content, "id", ""),
-                            "type": "function",
-                            "function": {
-                                "name": getattr(content, "name", ""),
-                                "arguments": json.dumps(
-                                    getattr(content, "arguments", {}),
-                                    ensure_ascii=False,
-                                ),
-                            },
-                        }
-                    )
-                if tool_calls_list:
-                    assistant_msg["tool_calls"] = tool_calls_list
                 api_messages.append(assistant_msg)
 
             elif msg.role == "toolResult":
@@ -1051,7 +1053,12 @@ class QwenLLMProvider:
             return value.count('"type": "function"')
         return 0
 
-    def _build_message_content(self, content_blocks: List[Any]) -> List[Dict[str, Any]]:
+    def _build_message_content(
+        self,
+        content_blocks: List[Any],
+        *,
+        include_tool_calls_text: bool = False,
+    ) -> List[Dict[str, Any]]:
         parts: List[Dict[str, Any]] = []
         for content in content_blocks:
             if content.type == "text":
@@ -1059,12 +1066,28 @@ class QwenLLMProvider:
             elif content.type == "thinking":
                 parts.append({"type": "text", "text": content.thinking})
             elif content.type == "toolCall":
-                continue
+                if include_tool_calls_text:
+                    parts.append({"type": "text", "text": self._render_text_tool_call(content)})
             elif content.type == "image":
                 raise ValueError(
                     "QwenLLMProvider 当前使用文本生成接口，不支持 image content。"
                 )
         return parts
+
+    def _render_text_tool_call(self, tool_call: ToolCall) -> str:
+        payload: Dict[str, Any] = {
+            "name": tool_call.name,
+            "arguments": tool_call.arguments,
+        }
+        if getattr(tool_call, "id", ""):
+            payload["id"] = tool_call.id
+        # Keep the replay format aligned with the protocol taught in the system
+        # prompt so past assistant turns look like something the model itself could
+        # have emitted.
+        return (
+            f"<tool_call>{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
+            "</tool_call>"
+        )
 
     def _extract_message_text(self, content: Any) -> str:
         if content is None:
@@ -1324,6 +1347,8 @@ class QwenLLMProvider:
 
         # Strategy 2: If no <tool_call> tags found, try extracting JSON candidates
         # directly from the text (handles missing tags or markdown-wrapped output)
+        # This fallback keeps the provider usable when the model follows the right
+        # JSON structure but misses the XML wrapper taught in the prompt.
         if not extracted:
             for candidate in self._extract_json_candidates(normalized_text):
                 raw_tool_calls: List[Any] = []
@@ -1445,16 +1470,11 @@ class QwenLLMProvider:
         tools: Optional[List[ToolDef]],
         kwargs: Dict[str, Any],
     ) -> str:
-        requested_mode = str(kwargs.get("tool_calling_mode", "auto") or "auto").lower()
-        if requested_mode not in {"auto", "native", "text"}:
-            requested_mode = "auto"
+        _ = model
+        _ = kwargs
         if not tools:
             return "text"
-        if requested_mode == "native":
-            return "native"
-        if requested_mode == "text":
-            return "text"
-        return "native" if self._model_supports_native_tool_calling(model) else "text"
+        return "text"
 
     async def _collect_attempt_events(
         self,
@@ -1643,6 +1663,9 @@ class QwenLLMProvider:
             thinking_index: Optional[int] = None
             streamed_text_full = ""
             streamed_thinking_full = ""
+            # Some wrapper deployments stream OpenAI-like `tool_calls` fragments even
+            # though the provider is operating in text mode. Keep both aggregation
+            # paths alive and reconcile them at the end of the turn.
             pending_tool_calls: Dict[str, Dict[str, str]] = {}
             completed = False
 
@@ -1708,6 +1731,8 @@ class QwenLLMProvider:
                             text_block = partial.content[text_index]
                             if isinstance(text_block, TextContent):
                                 final_text = text_block.text
+                        # For wrapper-style streams, tool calls are recovered only
+                        # after the full text transcript is assembled.
                         text_tool_calls = self._extract_text_tool_calls(final_text, tools)
                         logger.debug(
                             "[QWEN-STREAM] completed-via-status total_text_len=%s usage=%s",
@@ -1863,6 +1888,9 @@ class QwenLLMProvider:
                 ]
                 text_tool_calls: List[ToolCall] = []
                 if not existing_tool_calls and text_index is not None:
+                    # Prefer structured tool calls if the backend provided them; only
+                    # fall back to parsing the visible assistant text when no
+                    # structured tool call survived the stream.
                     text_block = partial.content[text_index]
                     final_text_for_tools = (
                         text_block.text if isinstance(text_block, TextContent) else ""

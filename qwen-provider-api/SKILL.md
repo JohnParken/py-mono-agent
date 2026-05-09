@@ -1,131 +1,67 @@
 ---
 name: qwen-provider-api
-description: Use when generating, modifying, or reviewing Qwen provider code for either this Python repo or TypeScript code in pi-mono. Covers the custom JSON wrapper API, text-protocol tool calling, non-OpenAI request and response shapes, and includes self-contained TypeScript scaffolding for pi-mono-style provider generation.
+description: Use when generating, modifying, or reviewing a Qwen provider that talks to a custom wrapper API, uses a fixed wrapper payload shape, and injects tool definitions through the first system prompt message in text mode.
 ---
 
 # Qwen Provider API
 
-Use this skill when implementing a Qwen provider that talks to a custom wrapper API instead
-of a standard OpenAI-compatible endpoint.
+Use this skill when you need to generate or modify a Qwen provider in any project, as long as the target provider follows these two core rules:
 
-This skill supports two targets:
+1. It must send requests to a custom wrapper API with a fixed payload shape.
+2. It must inject tool definitions and tool-calling protocol through the first `system` message, not through a top-level API `tools` field.
 
-- this Python repo, where the provider lives in `pi_ai/llm.py`
-- the TypeScript `pi-mono` repo, where a custom provider would typically live under
-  `packages/ai/src/providers/`
+This skill is intentionally independent of any one codebase. Treat it as a design and implementation guide for building the provider in a new project.
+
+## Main Goal
+
+This skill exists to preserve two implementation constraints:
+
+### 1. Fixed wrapper API payload shape
+
+The provider must build requests in this wrapper-oriented shape:
+
+- `token`
+- `apikey`
+- `type`
+- `modelId`
+- `appInfo`
+- `variable`
+- `data.messages`
+- `data.stream`
+
+Do not rewrite this into an OpenAI-style payload such as:
+
+- `{ model, messages, tools, stream }`
+
+If a project already has OpenAI providers, do not copy their request format into this provider.
+
+### 2. Tool injection through system prompt
+
+The provider must use text-mode tool calling.
+
+That means:
+
+- omit `data.tools`
+- build a full tool-use protocol prompt
+- inject that prompt into the first `system` message
+- require the model to emit text protocol tool calls like:
+  - `<tool_call>{"name":"...","arguments":{...}}</tool_call>`
+
+The provider may keep wrapper template placeholders such as `(tools)` or `variable.tools` for compatibility, but those placeholders are not the primary tool-injection path.
 
 ## When To Use This Skill
 
 Use this skill when the task involves any of these:
 
-- generating a new Qwen provider in TypeScript for `pi-mono`
-- porting this repo's `QwenLLMProvider` logic into TypeScript
-- adapting a custom proprietary wrapper API that is not OpenAI-compatible
-- preserving text-protocol tool-calling behavior
-- parsing nonstandard Qwen streaming chunks
-- injecting prompt templates for text fallback without hardcoding them inline
+- generating a new Qwen provider for a custom wrapper API
+- updating request construction for the wrapper payload shape
+- updating system-prompt-based tool injection
+- updating text-mode tool-call extraction
+- documenting or reviewing how the provider interacts with the model
 
-## Read These Files First
+## Required Request Shape
 
-### In this repo
-
-- `pi_ai/llm.py`
-- `pi_ai/qwen_request_template.json`
-- `pi_ai/prompts/qwen_tools/shared_rules.md`
-- `pi_ai/prompts/qwen_tools/text_rules.md`
-- `tests/test_qwen_provider.py`
-- `tests/test_qwen_prompt_builder.py`
-
-### In pi-mono
-
-Read these in the upstream repo before integrating generated TS code:
-
-- `packages/ai/src/types.ts`
-- `packages/ai/src/providers/openai-completions.ts`
-- `packages/coding-agent/src/core/system-prompt.ts`
-
-Use `openai-completions.ts` mainly as a reference for:
-
-- `StreamFunction` shape
-- `AssistantMessageEventStream` usage
-- output event conventions (`text_start`, `text_delta`, `toolcall_start`, etc.)
-- usage / stop reason handling
-
-Do not copy its request shape for Qwen wrapper APIs.
-
-## Important Difference From OpenAI
-
-This Qwen integration is not a normal OpenAI-compatible wrapper.
-
-- Do not assume request bodies follow `{ model, messages, tools, stream }`.
-- Do not assume tools are always sent in a `tools` field.
-- Do not assume responses only contain `choices[].delta`.
-- Treat this wrapper as a text-protocol tool-calling integration.
-
-If the API requires:
-
-- `token`
-- `apikey`
-- `appInfo`
-- `variable`
-- `data.messages`
-
-then build exactly that shape. Do not normalize it into OpenAI format just because the
-target repo already has OpenAI providers.
-
-## Core Concepts
-
-### Request shape
-
-This provider constructs a wrapper JSON payload. Typical top-level fields:
-
-- `token`: resolved provider token
-- `apikey`: optional app API key
-- `modelId`: model id
-- `appInfo`: wrapper-side settings
-- `variable`: prompt variables, especially the `tools` prompt variable
-- `data.messages`: message history in provider-specific shape
-
-### Tool-calling mode
-
-This skill assumes `tool_calling_mode="text"` only.
-
-Rules:
-
-- omit `data.tools`
-- place tool definitions and protocol instructions into the `variable.tools` prompt
-- require the model to emit `<tool_call>...</tool_call>` blocks in plain text
-- keep the implementation and documentation scoped to text mode only
-
-### Message mapping
-
-- user messages can be structured content arrays
-- assistant messages may include prior tool calls
-- tool results map to tool-role messages
-
-Keep one clear text-mode serializer in generated code.
-
-### Response parsing
-
-Support both of these response families:
-
-1. status/result wrapper chunks
-   - fields like `status`, `result`, `resCode`, `resMessage`
-   - common statuses may include `running`, `success`, and `completed`
-   - `result` should be treated as a streamed text chunk or delta, not a guaranteed final full response
-   - do not assume `status="success"` means the stream is finished; it may still be only one incremental fragment
-2. OpenAI-like output chunks
-   - fields like `output.choices[0].message`, `finish_reason`, `tool_calls`
-
-Do not simplify parsing to a single chunk shape.
-
-## Request And Response Examples
-
-Use concrete wrapper-shaped examples when generating code or reviewing payload handling.
-
-### Sample request payload
-
-This is the shape the provider should send in text mode:
+Build requests around this structure:
 
 ```json
 {
@@ -134,7 +70,7 @@ This is the shape the provider should send in text mode:
   "type": "txt",
   "modelId": "lightapplication",
   "appInfo": {
-    "agent_id": "e76d09a-fed2-4ac1-9317-bf419f624c21",
+    "agent_id": "wrapper-agent-id",
     "sensitive_judge": false,
     "safe_model_judge": false,
     "max_new_tokens": 81920,
@@ -144,19 +80,57 @@ This is the shape the provider should send in text mode:
   },
   "variable": [
     {
-      "name": "tools",
-      "value": "# Shared Tool Use Rules\n# Text Fallback Tool Protocol\n<tools>\n[{\"type\":\"function\",\"function\":{\"name\":\"echo\",\"description\":\"Echo text.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}}}]\n</tools>\nReturn tool calls inside <tool_call>...</tool_call>."
+      "name": "static_memory",
+      "value": "Optional reusable context"
     },
     {
-      "name": "static_memory",
-      "value": "Project Facts:\n- Repository root is /workspace\n- Coding style: snake_case"
+      "name": "tools",
+      "value": ""
     }
   ],
+  "data": {
+    "messages": [],
+    "stream": true
+  }
+}
+```
+
+### Request construction rules
+
+- `token` comes from the provider API key or wrapper auth token.
+- `apikey` is optional and belongs to the wrapper layer, not the model API itself.
+- `modelId` must be set explicitly from the selected model.
+- `appInfo` is wrapper configuration. Preserve its shape.
+- `variable` is a wrapper template variable list. It may include placeholders like:
+  - `static_memory`
+  - `tools`
+- `data.messages` is the actual conversational history sent to the model.
+- `data.stream` should stay aligned with the wrapper's streaming contract.
+
+## Tool Injection Through System Prompt
+
+The provider must construct one full text-mode tool prompt and place it in the first `system` message.
+
+That prompt should contain:
+
+- the user-supplied system prompt
+- shared tool-use rules
+- text-mode tool protocol rules
+- a `<tools>...</tools>` block containing all tool schemas
+- optional few-shot examples
+- a final reminder about emitting `<tool_call>` blocks
+
+### Expected message shape
+
+The request should look like this when tools are present:
+
+```json
+{
   "data": {
     "messages": [
       {
         "role": "system",
-        "content": "You are a tool-using assistant."
+        "content": "You are a tool-using assistant.\n\n# Shared Tool Use Rules\n...\n\n# Tools\n\n<tools>\n{\n  \"type\": \"function\",\n  \"function\": {\n    \"name\": \"read_file\",\n    \"description\": \"Read exact file contents with line numbers.\",\n    \"parameters\": {\n      \"type\": \"object\",\n      \"properties\": {\n        \"path\": {\"type\": \"string\"},\n        \"start_line\": {\"type\": \"integer\"}\n      }\n    }\n  }\n}\n</tools>\n\nIf a tool is needed, output one or more <tool_call>{\"name\":\"...\",\"arguments\":{...}}</tool_call> blocks."
       },
       {
         "role": "user",
@@ -167,192 +141,183 @@ This is the shape the provider should send in text mode:
           }
         ]
       }
-    ],
-    "stream": true
-  }
-}
-```
-
-Key expectations:
-
-- `variable.tools` carries the tool schema and text protocol instructions
-- `data.messages` stays in wrapper-specific message format
-- `data.tools` is absent
-- The request template's default `appInfo.prompt` is `"(tools)"`; when `static_memory` is provided, the provider dynamically prepends `"(static_memory)\n"` to the prompt without duplicating the placeholder
-
-### Sample streaming response: status/result wrapper
-
-Some deployments stream plain wrapper chunks like this. These chunks are incremental:
-
-```json
-{
-  "status": "running",
-  "result": "I will inspect the config first.\n",
-  "resCode": "PLA0000",
-  "resMessage": "OK",
-  "questionId": "q-123",
-  "sessionId": "s-456"
-}
-```
-
-```json
-{
-  "status": "success",
-  "result": "<tool_call>{\"name\":\"echo\",\"arguments\":{\"text\":\"hello\"}}</tool_call>",
-  "resCode": "PLA0000",
-  "resMessage": "OK",
-  "questionId": "q-123",
-  "sessionId": "s-456"
-}
-```
-
-```json
-{
-  "status": "completed",
-  "result": "",
-  "resCode": "PLA0000",
-  "resMessage": "OK",
-  "questionId": "q-123",
-  "sessionId": "s-456"
-}
-```
-
-Parsing expectations:
-
-- append each `result` fragment in arrival order
-- keep reading while `status` is a non-terminal success state such as `running` or `success`
-- do not finalize merely because a chunk says `success`
-- finalize only when the wrapper emits an explicit terminal state such as `completed`
-- after concatenation, extract any `<tool_call>...</tool_call>` block from the full text
-
-### Sample streaming response: OpenAI-like output
-
-Other deployments may stream OpenAI-like envelopes:
-
-```json
-{
-  "output": {
-    "choices": [
-      {
-        "message": {
-          "role": "assistant",
-          "content": "I will inspect the config first.\n<tool_call>{\"name\":\"echo\",\"arguments\":{\"text\":\"hello\"}}</tool_call>"
-        },
-        "finish_reason": "stop"
-      }
     ]
   }
 }
 ```
 
-The parser should read `output.choices[0].message.content`, preserve any visible text,
-and still extract the embedded `<tool_call>` JSON safely.
+### Important rules
 
-## Prompt Rules
+- The first `system` message is the primary tool-registration mechanism.
+- Do not rely on top-level request `tools`.
+- Do not describe `variable.tools` as the main carrier of tool schemas if the implementation uses `system` message injection.
+- Keep prompt assembly outside transport code when possible.
 
-Keep prompt assembly outside the provider transport logic.
+## Tool Schema Format
 
-Separate:
+Each tool should be converted to a function-schema JSON object like this:
 
-- shared rules
-- text-only protocol rules
-- optional few-shot examples
+```json
+{
+  "type": "function",
+  "function": {
+    "name": "edit_file",
+    "description": "Edit a single file using exact text replacement.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "edits": {
+          "type": "array"
+        }
+      },
+      "required": ["path"]
+    }
+  }
+}
+```
 
-In this Python repo, prompt assembly is already split into:
+These schema objects must be rendered into the `<tools>` block inside the first `system` message.
 
-- `pi_ai/prompts/qwen_tools/shared_rules.md`
-- `pi_ai/prompts/qwen_tools/text_rules.md`
-- `pi_ai/prompts/qwen_tools/builder.py`
+## Message Mapping Rules
 
-When generating TS code for `pi-mono`, preserve the same separation. Do not inline large
-prompt templates into the provider file unless the user explicitly asks for a single-file version.
+The provider should serialize messages with these rules:
 
-## TypeScript Guidance For pi-mono
+### System message
 
-In `pi-mono`, a good first implementation shape is:
+- The first message must be the fully assembled tool prompt.
 
-- file: `packages/ai/src/providers/qwen-wrapper.ts`
-- exported stream function:
-  - `streamQwenWrapper`
-  - `streamSimpleQwenWrapper`
-- custom API name:
-  - `"qwen-wrapper"` or another custom string API identifier
+### User messages
 
-Prefer a dedicated provider file instead of trying to force this API into
-`openai-completions.ts`.
+- User content may be serialized as structured content arrays.
+- Example:
+  - `{"role":"user","content":[{"type":"text","text":"Read config"}]}`
 
-### Minimal implementation plan in pi-mono
+### Assistant history
 
-1. Define a custom options type extending `StreamOptions`
-2. Build a wrapper payload from a JSON template or inline object
-3. Add `buildMessages()` for text-mode history
-4. Add `buildTools()` and prompt assembly helpers
-5. Implement one streaming function that:
-   - creates an `AssistantMessageEventStream`
-   - initializes an `AssistantMessage` partial
-   - streams and parses chunks
-   - emits text/tool/thinking events
-   - finalizes `done` or `error`
-6. Add tests for:
-   - request construction
-   - text-mode prompt shape
-   - text tool extraction
+- Preserve normal assistant text.
+- Preserve prior assistant tool calls by replaying them back to the model as text protocol blocks.
+- A prior tool call should be serialized like:
 
-## TypeScript Provider Template
+```text
+<tool_call>{"name":"read_file","arguments":{"path":"app.py","start_line":1},"id":"call_1"}</tool_call>
+```
 
-When generating TS code for `pi-mono`, read:
+Do not drop prior tool calls from assistant history. That makes the model lose track of what it already requested.
 
-- `references/pi-mono-qwen-provider-template.ts`
-- `references/pi-mono-integration-notes.md`
+### Tool results
 
-The template is intentionally self-contained so code generation does not need to infer the
-whole implementation from this repo.
+- Tool results should map to `role="tool"` messages.
+- Preserve `tool_call_id`.
+- Serialize the tool result content back to the model.
 
-## Python Mapping Notes
+Example:
 
-If you are porting from this repo, preserve these semantic equivalents:
+```json
+{
+  "role": "tool",
+  "tool_call_id": "call_1",
+  "content": [
+    {
+      "type": "text",
+      "text": "FILE: app.py\nLINES: 1-5 of 42\n1: def main(): ..."
+    }
+  ]
+}
+```
 
-- `construct_request()` -> TS payload builder
-- `_build_messages()` -> TS text-mode serializer
-- `_extract_text_tool_calls()` -> TS text tool parser
-- `stream()` -> TS `StreamFunction`
-- `_stream_request()` -> TS fetch/SSE/JSON wrapper reader
+## Expected Tool Protocol
 
-## Tool Call Normalization Rules
+The text protocol should instruct the model to emit tool calls in this exact form:
 
-Text-mode tool extraction should remain defensive.
+```text
+<tool_call>{"name":"<tool-name>","arguments":{...}}</tool_call>
+```
+
+Rules:
+
+- one tool call per `<tool_call>` block
+- each block must contain valid JSON
+- `name` must match one of the tools in `<tools>`
+- `arguments` must be a JSON object
+- value types must match the tool schema
+- when multiple tools are needed, output multiple `<tool_call>` blocks
+
+## Response Parsing Rules
+
+Support both of these response families.
+
+### 1. Wrapper `status/result` chunks
+
+Fields may include:
+
+- `status`
+- `result`
+- `resCode`
+- `resMessage`
+- `questionId`
+- `sessionId`
+
+Rules:
+
+- append each `result` fragment in arrival order
+- treat `running` and `success` as non-terminal fragments
+- finalize only on an explicit terminal state such as `completed`
+- after the full text is assembled, extract `<tool_call>...</tool_call>`
+
+### 2. OpenAI-like `output.choices` chunks
+
+Fields may include:
+
+- `output.choices[0].message.content`
+- `output.choices[0].message.tool_calls`
+- `finish_reason`
+
+Rules:
+
+- preserve visible text
+- if structured `tool_calls` appear, aggregate streamed fragments
+- if structured tool calls are absent, still parse embedded text protocol calls from the final text
+
+## Tool Call Extraction Rules
+
+The parser should remain defensive.
 
 Preserve these behaviors:
 
 - normalize BOM and Windows newlines
-- parse JSON candidates from free text
+- strip markdown fences around candidate JSON
+- parse `<tool_call>...</tool_call>` first
+- if no tags are found, try raw JSON candidates from free text
 - accept:
-  - `{"tool_calls":[...]}`
-  - `{"tool_call": {...}}`
   - direct `{"name":"...","arguments":{...}}`
-- accept arguments as either dict/object or JSON string
-- reject tool names not in the available tool set
-- deduplicate equivalent tool calls
+  - `{"tool_call": {...}}`
+  - `{"tool_calls":[...]}`
+- accept arguments as either:
+  - JSON object
+  - JSON string containing an object
+  - recoverable Python-literal-like object string
+- reject tool names not present in the available tool set
 
-## Safe Change Checklist
+## Implementation Checklist
 
-Before finishing a Qwen-related change, verify:
+When generating provider code, make sure all of these are true:
 
-- request payload still matches the custom wrapper contract
-- text mode still omits `data.tools`
-- text prompt still contains `<tools>` and `<tool_call>` instructions
-- wrapped JSON and Windows-formatted tool-call text still parse
-
-## Tests To Run In This Repo
-
-- `uv run python -m unittest tests.test_qwen_prompt_builder`
-- `uv run python -m unittest tests.test_qwen_provider`
-- `uv run python -m unittest tests.test_agent_loop_safety`
+- request payload matches the fixed wrapper contract
+- top-level `data.tools` is absent in text mode
+- the first `system` message contains the full tool protocol
+- tool schemas are rendered into `<tools>`
+- prior assistant tool calls are replayed as `<tool_call>` text
+- tool results are sent back as `role="tool"` messages
+- final text is scanned for tool calls before ending the turn
 
 ## What To Avoid
 
-- do not rewrite the wrapper API into OpenAI chat format
-- do not add extra tool-calling branches beyond text mode
-- do not hide the text tool protocol in transport code without tests
-- do not bury prompt templates inline in the transport layer
-- do not assume pi-mono provider code can reuse OpenAI request construction unchanged
+- do not convert the provider to OpenAI request shape
+- do not rely on native function-calling registration for this provider
+- do not document `variable.tools` as the primary registration path if the real path is the first `system` message
+- do not drop prior tool calls from assistant history
+- do not let examples disagree with runtime message roles
+- do not hide prompt assembly inside transport code without documenting the final system-prompt structure

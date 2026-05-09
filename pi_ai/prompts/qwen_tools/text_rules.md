@@ -12,7 +12,7 @@ Use this exact format for each tool call:
 
 - The entire tool call must be on a single line.
 - `name` must be one of the tool names listed in the `<tools>` section below.
-- `arguments` must be a valid JSON object with double-quoted keys and double-quoted string values.
+- `arguments` must be a valid JSON object with double-quoted keys. Use JSON values that match the tool schema, including strings, numbers, booleans, null, arrays, or nested objects when required.
 - Do not wrap the JSON in markdown code fences (```).
 - Do not add any text, explanation, or commentary before or after the `<tool_call>` block.
 
@@ -31,7 +31,7 @@ When multiple tools are needed in the same turn, output each in its own `<tool_c
 - If no tool is needed, respond with normal text directly.
 - Never mix explanatory text with tool calls in the same turn.
 - Use only tool names listed in `<tools>`.
-- Arguments must be valid JSON with double-quoted keys and strings.
+- Arguments must be valid JSON with double-quoted keys, and value types must match the selected tool schema.
 - Prefer one informative tool call per turn. If the path is unknown, search first.
 - If the path is known, read directly. Before editing, read the relevant file content first.
 - When changing multiple separate locations in one file, prefer a single `edit_file` call with an `edits[]` array instead of multiple `edit_file` calls.

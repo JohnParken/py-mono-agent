@@ -45,10 +45,12 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["modelId"], "lightapplication")
         self.assertEqual(payload["appInfo"]["agent_id"], "custom-agent")
         self.assertEqual(payload["appInfo"]["temperature"], 0.1)
-        self.assertIn("# Tools", payload["variable"][0]["value"])
-        self.assertIn("<tools>", payload["variable"][0]["value"])
-        self.assertIn("<tool_call>", payload["variable"][0]["value"])
+        self.assertEqual(payload["variable"][0]["value"], "")
         self.assertNotIn("tools", payload["data"])
+        self.assertEqual(payload["data"]["messages"][0]["role"], "system")
+        self.assertIn("# Tools", payload["data"]["messages"][0]["content"])
+        self.assertIn("<tools>", payload["data"]["messages"][0]["content"])
+        self.assertIn("<tool_call>", payload["data"]["messages"][0]["content"])
 
     def test_construct_request_unsupported_mode_falls_back_to_text(self):
         qwen_model = Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct")
@@ -63,7 +65,8 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertNotIn("tools", payload["data"])
-        text_prompt = payload["variable"][0]["value"]
+        self.assertEqual(payload["variable"][0]["value"], "")
+        text_prompt = payload["data"]["messages"][0]["content"]
         self.assertIn("# Text Fallback Tool Protocol", text_prompt)
         self.assertIn("<tools>", text_prompt)
         self.assertIn("<tool_call>", text_prompt)
@@ -81,7 +84,8 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertNotIn("tools", payload["data"])
-        auto_prompt = payload["variable"][0]["value"]
+        self.assertEqual(payload["variable"][0]["value"], "")
+        auto_prompt = payload["data"]["messages"][0]["content"]
         self.assertIn("# Text Fallback Tool Protocol", auto_prompt)
         self.assertIn("<tool_call>", auto_prompt)
 
@@ -98,11 +102,12 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertNotIn("tools", payload["data"])
-        text_prompt = payload["variable"][0]["value"]
+        self.assertEqual(payload["variable"][0]["value"], "")
+        text_prompt = payload["data"]["messages"][0]["content"]
         self.assertIn("# Text Fallback Tool Protocol", text_prompt)
         self.assertIn("<tool_call>", text_prompt)
 
-    def test_construct_request_text_mode_does_not_inject_tool_interactions(self):
+    def test_construct_request_text_mode_replays_assistant_tool_interactions_as_text(self):
         assistant_message = AssistantMessage(
             content=[
                 TextContent(text="I will use tool."),
@@ -119,7 +124,8 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
             tool_calling_mode="text",
         )
 
-        tools_prompt = payload["variable"][0]["value"]
+        self.assertEqual(payload["variable"][0]["value"], "")
+        tools_prompt = payload["data"]["messages"][0]["content"]
         self.assertIn("# Shared Tool Use Rules", tools_prompt)
         self.assertIn("# Text Fallback Tool Protocol", tools_prompt)
         self.assertIn("# Tools", tools_prompt)
@@ -127,6 +133,11 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<tool_call>", tools_prompt)
         self.assertIn("# Examples", tools_prompt)
         self.assertNotIn("tools", payload["data"])
+        self.assertEqual(payload["data"]["messages"][1]["role"], "assistant")
+        self.assertNotIn("tool_calls", payload["data"]["messages"][1])
+        assistant_content = payload["data"]["messages"][1]["content"]
+        self.assertEqual(assistant_content[0]["text"], "I will use tool.")
+        self.assertIn('<tool_call>{"name":"echo","arguments":{"text":"hi"},"id":"call_1"}</tool_call>', assistant_content[1]["text"])
 
     def test_construct_request_text_mode_injects_static_memory_variable(self):
         payload = self.provider.construct_request(
@@ -161,7 +172,7 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(payload["appInfo"]["prompt"].count("(static_memory)"), 1)
 
-    def test_construct_request_text_messages_match_openai_compatible_shape(self):
+    def test_build_native_messages_match_openai_compatible_shape(self):
         assistant_message = AssistantMessage(
             content=[
                 TextContent(text="I will inspect the file."),
@@ -173,32 +184,24 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
             tool_name="echo",
             content=[TextContent(text="ok")],
         )
-        payload = self.provider.construct_request(
-            model=Model(provider="QwenLLMprovider", id="qwen3.6-35b-a3b-instruct"),
-            messages=[
+        api_messages = self.provider._build_native_messages(
+            [
                 assistant_message,
                 tool_result,
-            ],
-            system_prompt="You are a tool-using assistant.",
-            tools=[DummyTool()],
-            api_key="dash-token",
-            tool_calling_mode="native",
+            ]
         )
 
-        api_messages = payload["data"]["messages"]
-        self.assertEqual(api_messages[0]["role"], "system")
-        self.assertIn("You are a tool-using assistant.", api_messages[0]["content"])
-        self.assertEqual(api_messages[1]["role"], "assistant")
-        self.assertIsInstance(api_messages[1].get("content"), list)
-        self.assertIn("tool_calls", api_messages[1])
-        self.assertEqual(api_messages[2]["role"], "tool")
+        self.assertEqual(api_messages[0]["role"], "assistant")
+        self.assertEqual(api_messages[0]["content"], "I will inspect the file.")
+        self.assertIn("tool_calls", api_messages[0])
+        self.assertEqual(api_messages[1]["role"], "tool")
         self.assertEqual(
-            api_messages[2]["content"],
-            [{"type": "text", "text": "ok"}],
+            api_messages[1]["content"],
+            "ok",
         )
-        self.assertEqual(api_messages[2]["tool_call_id"], "call_1")
+        self.assertEqual(api_messages[1]["tool_call_id"], "call_1")
 
-    def test_build_messages_keeps_assistant_tool_calls(self):
+    def test_build_messages_injects_system_prompt_and_replays_tool_calls_as_text(self):
         assistant_message = AssistantMessage(
             content=[
                 TextContent(text="I will inspect the file."),
@@ -206,14 +209,17 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
-        messages = self.provider._build_messages([assistant_message], system_prompt="")
-
-        self.assertEqual(messages[0]["role"], "assistant")
-        self.assertEqual(messages[0]["tool_calls"][0]["function"]["name"], "echo")
-        self.assertEqual(
-            messages[0]["tool_calls"][0]["function"]["arguments"],
-            '{"text": "hi"}',
+        messages = self.provider._build_messages(
+            [assistant_message],
+            system_prompt="You are a tool-using assistant.",
         )
+
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[0]["content"], "You are a tool-using assistant.")
+        self.assertEqual(messages[1]["role"], "assistant")
+        self.assertNotIn("tool_calls", messages[1])
+        self.assertEqual(messages[1]["content"][0]["text"], "I will inspect the file.")
+        self.assertIn('<tool_call>{"name":"echo","arguments":{"text":"hi"},"id":"call_1"}</tool_call>', messages[1]["content"][1]["text"])
 
     def test_parse_tool_call_arguments_extracts_nested_arguments_object(self):
         parsed_arguments, raw_text = self.provider._parse_tool_call_arguments(
@@ -276,7 +282,8 @@ class QwenProviderTests(unittest.IsolatedAsyncioTestCase):
                 tool_calling_mode="text",
             )
 
-            text_prompt = text_payload["variable"][0]["value"]
+            self.assertEqual(text_payload["variable"][0]["value"], "")
+            text_prompt = text_payload["data"]["messages"][0]["content"]
             self.assertIn('"name": "edit_file"', text_prompt)
             self.assertIn('"edits"', text_prompt)
             self.assertIn("Example 5: Editing a file", text_prompt)
